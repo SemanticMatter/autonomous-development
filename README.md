@@ -77,8 +77,40 @@ Install Codex CLI when needed:
 
 ```bash
 npm install -g @openai/codex
-codex login
 ```
+
+### Codex authentication
+
+The workflow drives Codex through `codex exec`, so Codex must be able to reach a
+model. Two authentication methods are supported, and `controller.py doctor`
+detects which one your `~/.codex/config.toml` selects (it is `CODEX_HOME`-aware):
+
+1. **ChatGPT / OpenAI login** (the built-in `openai` provider): run `codex login`.
+   `doctor` verifies this with `codex login status`.
+2. **API-key provider** (`preferred_auth_method = "apikey"`), including custom
+   providers such as **Azure / MS Foundry**: Codex reads the key from the
+   environment variable named by that provider's `env_key`. For example:
+
+   ```toml
+   model_provider = "azure"
+   preferred_auth_method = "apikey"
+
+   [model_providers.azure]
+   name = "Azure"
+   base_url = "https://<resource>.openai.azure.com/openai/v1"
+   env_key = "AZURE_OPENAI_API_KEY"
+   wire_api = "responses"
+   ```
+
+   Configuring `config.toml` is **not** sufficient on its own — the variable named
+   by `env_key` must be exported in the environment that runs the workflow:
+
+   ```bash
+   export AZURE_OPENAI_API_KEY="…"
+   ```
+
+   With an API-key provider configured, a missing `codex login` is expected and is
+   **not** an error; `doctor` checks that the `env_key` variable is set instead.
 
 The official OpenAI Codex plugin for Claude Code is optional for this project because the workflow invokes `codex exec` directly to obtain schema-validated output. It remains useful for manual `/codex:*` commands:
 
@@ -89,12 +121,27 @@ The official OpenAI Codex plugin for Claude Code is optional for this project be
 /codex:setup
 ```
 
-## Run locally
+## Install as a plugin
 
-From the parent directory of this plugin:
+Register this repository as a local marketplace (it ships a
+`.claude-plugin/marketplace.json`) and install it through Claude Code's plugin
+system. This persists across restarts and works in the VS Code extension, which
+manages plugins through `~/.claude/plugins` rather than CLI flags:
 
 ```bash
-claude --plugin-dir ./claude-codex-autonomous-development
+claude plugin marketplace add /path/to/autonomous-development
+claude plugin install autonomous-development@autonomous-development
+```
+
+The `/autonomous-development:*` skills become available in the next session.
+
+## Run locally
+
+Alternatively, for an ephemeral load without installing, point Claude at the
+plugin directory from its parent:
+
+```bash
+claude --plugin-dir ./autonomous-development
 ```
 
 Then open a target repository and invoke:

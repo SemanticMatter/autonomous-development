@@ -15,7 +15,7 @@ import sys
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Mapping
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from state import (
@@ -1254,6 +1254,86 @@ def _describe_blocking_findings(
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Codex authentication detection
+# ---------------------------------------------------------------------------
+
+# Codex's built-in `openai` provider authenticates with a ChatGPT/OpenAI login
+# (the `codex login` flow, recorded in ~/.codex/auth.json). Any other provider,
+# or an explicit `preferred_auth_method = "apikey"`, authenticates with an API
+# key read from the environment variable named by the provider's `env_key`. For
+# the built-in provider that variable defaults to OPENAI_API_KEY.
+_CODEX_DEFAULT_PROVIDER = "openai"
+_CODEX_DEFAULT_API_KEY_VAR = "OPENAI_API_KEY"
+
+
+def _load_codex_config(environ: Mapping[str, str]) -> dict[str, Any]:
+    """Read Codex's config.toml (CODEX_HOME-aware).
+
+    Returns an empty dict when the file is absent or unparseable so callers
+    degrade to Codex's default ChatGPT-login expectation rather than crashing.
+    """
+    home = environ.get("CODEX_HOME")
+    base = Path(home) if home else Path(environ.get("HOME") or Path.home()) / ".codex"
+    path = base / "config.toml"
+    if not path.exists():
+        return {}
+    try:
+        import tomllib
+
+        with path.open("rb") as handle:
+            loaded = tomllib.load(handle)
+        return loaded if isinstance(loaded, dict) else {}
+    except Exception:
+        # A malformed config is itself a problem, but auth detection should not
+        # crash doctor; fall back to the default ChatGPT-login expectation.
+        return {}
+
+
+def _codex_auth_plan(
+    config: Mapping[str, Any], environ: Mapping[str, str]
+) -> dict[str, Any]:
+    """Decide how Codex authenticates, given its config.toml + environment.
+
+    Returns a plan dict:
+      mode      "apikey" | "chatgpt"
+      provider  the resolved model_provider name
+      key_var   environment variable holding the API key (apikey mode) or None
+      satisfied for apikey mode, whether key_var is set; None for chatgpt mode
+                (the caller probes `codex login status` for that case)
+    """
+    provider = str(config.get("model_provider") or _CODEX_DEFAULT_PROVIDER)
+    providers = config.get("model_providers")
+    provider_cfg: Mapping[str, Any] = {}
+    if isinstance(providers, dict) and isinstance(providers.get(provider), dict):
+        provider_cfg = providers[provider]
+    auth_method = config.get("preferred_auth_method")
+
+    # ChatGPT login is used only by the built-in provider when no API-key method
+    # is requested. A custom provider, or an explicit apikey method, is API-key.
+    uses_chatgpt = auth_method == "chatgpt" or (
+        auth_method is None and provider == _CODEX_DEFAULT_PROVIDER
+    )
+    if uses_chatgpt:
+        return {
+            "mode": "chatgpt",
+            "provider": provider,
+            "key_var": None,
+            "satisfied": None,
+        }
+
+    key_var = provider_cfg.get("env_key")
+    if not key_var and provider == _CODEX_DEFAULT_PROVIDER:
+        key_var = _CODEX_DEFAULT_API_KEY_VAR
+    satisfied = bool(key_var and environ.get(str(key_var)))
+    return {
+        "mode": "apikey",
+        "provider": provider,
+        "key_var": key_var,
+        "satisfied": satisfied,
+    }
+
+
 def cmd_doctor(args: argparse.Namespace) -> int:
     # Use project_root fallback for doctor; git check is optional
     start = Path(args.project_root).resolve() if args.project_root else Path.cwd()
@@ -1300,12 +1380,35 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         print(
             f'Codex version: {(version.stdout or version.stderr).strip() or "unknown"}'
         )
-        auth = run_process(["codex", "login", "status"], cwd=start)
-        print(
-            f'Codex authentication: {"ready" if auth.returncode == 0 else "not ready"}'
-        )
-        if auth.returncode != 0:
-            failures.append("Codex is not authenticated; run `codex login`")
+        plan = _codex_auth_plan(_load_codex_config(os.environ), os.environ)
+        if plan["mode"] == "apikey":
+            key_var = plan["key_var"] or "the provider's configured env_key"
+            print(
+                f'Codex auth method: API key (provider {plan["provider"]!r} '
+                f"via {key_var})"
+            )
+            ready = bool(plan["satisfied"])
+            print(f'Codex authentication: {"ready" if ready else "not ready"}')
+            if not ready:
+                failures.append(
+                    f"Codex provider {plan['provider']!r} uses API-key "
+                    f"authentication, but the {key_var} environment variable is "
+                    "not set. Export it (configuring ~/.codex/config.toml alone "
+                    "is not enough), or run `codex login` to use ChatGPT/OpenAI "
+                    "authentication instead."
+                )
+        else:
+            print("Codex auth method: ChatGPT/OpenAI login")
+            auth = run_process(["codex", "login", "status"], cwd=start)
+            print(
+                f'Codex authentication: {"ready" if auth.returncode == 0 else "not ready"}'
+            )
+            if auth.returncode != 0:
+                failures.append(
+                    "Codex is not authenticated; run `codex login`, or configure "
+                    "an API-key provider (e.g. Azure/MS Foundry) in "
+                    "~/.codex/config.toml and export its env_key."
+                )
 
     if failures:
         print("\nDoctor found problems:", file=sys.stderr)

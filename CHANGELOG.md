@@ -3,6 +3,18 @@
 ## Unreleased
 
 ### Added
+- Local marketplace manifest (`.claude-plugin/marketplace.json`) so the plugin can
+  be registered and installed through Claude Code's `/plugin` UI (e.g. in the VS
+  Code extension) with `claude plugin marketplace add <path>` followed by
+  `claude plugin install autonomous-development@autonomous-development`, instead of
+  only the ephemeral `claude --plugin-dir` flag.
+- `doctor` now detects Codex's configured authentication method from
+  `~/.codex/config.toml` (CODEX_HOME-aware). API-key providers — including custom
+  ones such as Azure / MS Foundry (`preferred_auth_method = "apikey"`) — are
+  recognised and verified by checking that the provider's `env_key` (e.g.
+  `AZURE_OPENAI_API_KEY`) is exported, rather than incorrectly demanding a
+  ChatGPT/OpenAI `codex login`. The ChatGPT-login path is unchanged for the
+  built-in `openai` provider.
 - Evidence-preserving cumulative review ledger: each entry in `cumulative_findings`
   now stores the full review evidence inline (`file`, `line_start`, `description`,
   `evidence`, `recommended_fix`) plus an `origin` provenance tag
@@ -55,6 +67,13 @@
 - `prompts/code-review-delta.md` and `schemas/review-delta.schema.json`
 - `schemas/accept-decisions.schema.json`
 - `skills/autonomous-feature/references/`: per-phase guidance loaded only when needed
+
+### Fixed
+- `doctor` no longer reports "Codex is not authenticated; run `codex login`" when
+  Codex is correctly configured to use an API-key provider. It instead fails closed
+  with an actionable message when the required `env_key` is missing, making explicit
+  that configuring `config.toml` alone is not enough — the named environment
+  variable must be exported.
 
 ### Changed
 - Completion gate now enforces review consistency (fail closed). Every cumulative

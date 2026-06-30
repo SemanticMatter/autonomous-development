@@ -2945,5 +2945,78 @@ class EvidencePreservingReviewTests(unittest.TestCase):
         self.assertEqual(blocked_ids, {"AC-2", "AC-3", "AC-4"})
 
 
+class CodexAuthDetectionTests(unittest.TestCase):
+    """`doctor` must recognise API-key providers (e.g. Azure / MS Foundry) and
+    not demand a ChatGPT/OpenAI login when one is configured."""
+
+    def test_default_config_uses_chatgpt_login(self) -> None:
+        # No config / built-in provider → the classic `codex login` path.
+        plan = controller._codex_auth_plan({}, {})
+        self.assertEqual(plan["mode"], "chatgpt")
+        self.assertIsNone(plan["key_var"])
+        self.assertIsNone(plan["satisfied"])
+
+    def test_custom_provider_apikey_present_is_ready(self) -> None:
+        config = {
+            "model_provider": "azure",
+            "preferred_auth_method": "apikey",
+            "model_providers": {"azure": {"env_key": "AZURE_OPENAI_API_KEY"}},
+        }
+        plan = controller._codex_auth_plan(config, {"AZURE_OPENAI_API_KEY": "secret"})
+        self.assertEqual(plan["mode"], "apikey")
+        self.assertEqual(plan["provider"], "azure")
+        self.assertEqual(plan["key_var"], "AZURE_OPENAI_API_KEY")
+        self.assertTrue(plan["satisfied"])
+
+    def test_custom_provider_apikey_missing_is_not_satisfied(self) -> None:
+        # config.toml alone is not enough: the named env var must be exported.
+        config = {
+            "model_provider": "azure",
+            "model_providers": {"azure": {"env_key": "AZURE_OPENAI_API_KEY"}},
+        }
+        plan = controller._codex_auth_plan(config, {})
+        self.assertEqual(plan["mode"], "apikey")
+        self.assertEqual(plan["key_var"], "AZURE_OPENAI_API_KEY")
+        self.assertFalse(plan["satisfied"])
+
+    def test_builtin_provider_apikey_defaults_to_openai_api_key(self) -> None:
+        config = {"preferred_auth_method": "apikey"}
+        ready = controller._codex_auth_plan(config, {"OPENAI_API_KEY": "k"})
+        self.assertEqual(ready["mode"], "apikey")
+        self.assertEqual(ready["key_var"], "OPENAI_API_KEY")
+        self.assertTrue(ready["satisfied"])
+        missing = controller._codex_auth_plan(config, {})
+        self.assertFalse(missing["satisfied"])
+
+    def test_explicit_chatgpt_method_overrides_custom_provider(self) -> None:
+        config = {"model_provider": "azure", "preferred_auth_method": "chatgpt"}
+        plan = controller._codex_auth_plan(config, {})
+        self.assertEqual(plan["mode"], "chatgpt")
+
+    def test_load_codex_config_honours_codex_home(self) -> None:
+        tmp = Path(tempfile.mkdtemp())
+        try:
+            (tmp / "config.toml").write_text(
+                'model_provider = "azure"\n'
+                'preferred_auth_method = "apikey"\n'
+                "[model_providers.azure]\n"
+                'env_key = "AZURE_OPENAI_API_KEY"\n',
+                encoding="utf-8",
+            )
+            config = controller._load_codex_config({"CODEX_HOME": str(tmp)})
+            self.assertEqual(config["model_provider"], "azure")
+            plan = controller._codex_auth_plan(config, {"AZURE_OPENAI_API_KEY": "x"})
+            self.assertTrue(plan["satisfied"])
+        finally:
+            shutil.rmtree(str(tmp), ignore_errors=True)
+
+    def test_load_codex_config_missing_file_returns_empty(self) -> None:
+        tmp = Path(tempfile.mkdtemp())
+        try:
+            self.assertEqual(controller._load_codex_config({"CODEX_HOME": str(tmp)}), {})
+        finally:
+            shutil.rmtree(str(tmp), ignore_errors=True)
+
+
 if __name__ == "__main__":
     unittest.main()
