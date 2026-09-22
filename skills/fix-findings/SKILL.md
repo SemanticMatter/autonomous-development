@@ -11,8 +11,10 @@ disallowed-tools: AskUserQuestion
 
 1. Locate the latest review file and any prior triage files. Use `controller.py status --json`
    to find `reviews[-1].path` (resolved relative to the run directory), or run
-   `controller.py show-run` to inspect the full run state.
-2. Classify every finding as one of:
+   `controller.py show-run` to inspect the full run state. If an adversarial review
+   ran, its `threats` are also in the cumulative ledger (`T-<n>` ids, alongside
+   review findings' `F-<n>` ids) — `triage`'s `finding_id` field accepts either.
+2. Classify every finding (and adversarial threat) as one of:
    - `accepted`;
    - `rejected_with_evidence`;
    - `already_resolved`;

@@ -17,6 +17,8 @@ REVIEW = "schemas/review.schema.json"
 REVIEW_DELTA = "schemas/review-delta.schema.json"
 ADVERSARIAL = "schemas/adversarial-review.schema.json"
 TRIAGE = "schemas/triage.schema.json"
+PR_METADATA = "schemas/pr-metadata.schema.json"
+IMPORTED_VERIFICATION = "schemas/imported-verification.schema.json"
 
 
 def _valid_review() -> dict:
@@ -214,6 +216,87 @@ class TriageSchemaTests(unittest.TestCase):
                         TRIAGE,
                     )
                 self.assertIn("/0/finding_id", str(ctx.exception))
+
+
+class PrMetadataSchemaTests(unittest.TestCase):
+    def test_minimal_metadata_accepted(self) -> None:
+        validate_payload({}, PR_METADATA)
+
+    def test_full_metadata_accepted(self) -> None:
+        validate_payload(
+            {
+                "title": "Add auth",
+                "description": "Body",
+                "pr_url": "https://example/pr/1",
+                "pr_number": 1,
+                "author": "dev",
+                "issues": ["ISSUE-1"],
+                "labels": ["security"],
+            },
+            PR_METADATA,
+        )
+
+    def test_pr_number_string_or_int(self) -> None:
+        validate_payload({"pr_number": "42"}, PR_METADATA)
+        validate_payload({"pr_number": 42}, PR_METADATA)
+
+    def test_unknown_top_level_property_rejected(self) -> None:
+        # A typo must not silently drop provenance.
+        with self.assertRaises(SchemaValidationError):
+            validate_payload({"titel": "x"}, PR_METADATA)
+
+    def test_issues_must_be_array(self) -> None:
+        with self.assertRaises(SchemaValidationError):
+            validate_payload({"issues": "ISSUE-1"}, PR_METADATA)
+
+
+class ImportedVerificationSchemaTests(unittest.TestCase):
+    def test_minimal_passing_evidence_accepted(self) -> None:
+        validate_payload([{"name": "unit", "status": "passed"}], IMPORTED_VERIFICATION)
+
+    def test_full_evidence_accepted(self) -> None:
+        validate_payload(
+            [
+                {
+                    "name": "ci",
+                    "status": "failed",
+                    "command": "pytest -q",
+                    "source": "github-actions",
+                    "target_sha": "abc123",
+                    "url": "https://example/run/1",
+                    "details": "3 failures",
+                }
+            ],
+            IMPORTED_VERIFICATION,
+        )
+
+    def test_non_array_rejected(self) -> None:
+        with self.assertRaises(SchemaValidationError):
+            validate_payload({"name": "x", "status": "passed"}, IMPORTED_VERIFICATION)
+
+    def test_missing_status_rejected(self) -> None:
+        with self.assertRaises(SchemaValidationError) as ctx:
+            validate_payload([{"name": "x"}], IMPORTED_VERIFICATION)
+        self.assertIn("status", str(ctx.exception))
+
+    def test_missing_name_rejected(self) -> None:
+        with self.assertRaises(SchemaValidationError) as ctx:
+            validate_payload([{"status": "passed"}], IMPORTED_VERIFICATION)
+        self.assertIn("name", str(ctx.exception))
+
+    def test_unknown_status_rejected(self) -> None:
+        with self.assertRaises(SchemaValidationError) as ctx:
+            validate_payload(
+                [{"name": "x", "status": "green"}], IMPORTED_VERIFICATION
+            )
+        self.assertIn("/0/status", str(ctx.exception))
+
+    def test_unknown_property_rejected(self) -> None:
+        with self.assertRaises(SchemaValidationError):
+            validate_payload(
+                [{"name": "x", "status": "passed", "bogus": 1}],
+                IMPORTED_VERIFICATION,
+            )
 
 
 class JsonPointerEscapingTests(unittest.TestCase):

@@ -1,0 +1,37 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Imported verification evidence",
+  "description": "Externally asserted CI/verification evidence for an imported PR review. These are NOT locally executed controller run-check results: each entry records provenance (command, status, source) and the target SHA it was produced against so stale/failed/missing evidence is surfaced as a review gap and never treated as a passing local check. A list of evidence entries.",
+  "type": "array",
+  "items": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["name", "status"],
+    "properties": {
+      "name": {
+        "type": "string",
+        "minLength": 1,
+        "description": "Logical check name (e.g. unit-tests, lint)."
+      },
+      "status": {
+        "type": "string",
+        "enum": ["passed", "failed", "errored", "cancelled", "skipped", "pending", "unknown"],
+        "description": "Externally asserted outcome. Only 'passed' may count toward evidence, and only when the target SHA matches the imported head."
+      },
+      "command": {
+        "type": "string",
+        "description": "The command/CI job that produced this result, for provenance."
+      },
+      "source": {
+        "type": "string",
+        "description": "Where the evidence came from (e.g. github-actions, jenkins, manual)."
+      },
+      "target_sha": {
+        "type": "string",
+        "description": "The commit SHA this evidence was produced against. Compared to the imported target HEAD to detect stale evidence. For informational (non-trusted) evidence, accepts the full 40-character SHA or a hex prefix of at least 7 characters, case-insensitively; this is a PREFIX match, not a check that the prefix is unambiguous in the object database. Under --trust-verification (the only path that can satisfy the completion gate), the FULL 40-character SHA is required; a prefix is reported as stale. Anything else (a tag, a branch name, a shorter prefix) is reported as stale."
+      },
+      "url": {"type": "string"},
+      "details": {"type": "string"}
+    }
+  }
+}

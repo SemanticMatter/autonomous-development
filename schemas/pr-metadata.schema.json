@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Imported PR metadata",
+  "description": "Optional structured metadata describing an existing PR/branch being imported for review. Supplied from a local file or stdin (v1 has no GitHub API dependency). Only used to enrich the derived accepted spec/plan and risk classification; never to mutate the target repository. Unknown top-level keys are rejected so a typo cannot silently drop provenance.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "title": {"type": "string"},
+    "description": {"type": "string"},
+    "pr_url": {"type": "string"},
+    "pr_number": {"type": ["string", "integer"]},
+    "author": {"type": "string"},
+    "issues": {
+      "type": "array",
+      "items": {"type": "string"}
+    },
+    "labels": {
+      "type": "array",
+      "items": {"type": "string"}
+    }
+  }
+}

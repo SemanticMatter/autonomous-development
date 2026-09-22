@@ -4,3 +4,8 @@ __pycache__/
 .pytest_cache/
 .DS_Store
 .ai/
+# Local editor / agent settings — ignored portably (not reliant on a global
+# gitignore) so they never leak into a PR on a fresh clone / other machine.
+.claude/
+.vscode/
+.idea/

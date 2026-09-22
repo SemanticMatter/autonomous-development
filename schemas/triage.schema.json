@@ -28,8 +28,8 @@
       },
       "finding_id": {
         "type": "string",
-        "pattern": "^F-[0-9]+$",
-        "description": "Canonical review id (F-N) of the cumulative finding this disposition releases or re-blocks. A malformed id is silently ignored by the merge, so it is rejected here rather than misreported as recorded."
+        "pattern": "^[FT]-[0-9]+$",
+        "description": "Canonical id of the cumulative entry this disposition releases or re-blocks: a review finding (F-N) or an adversarial threat (T-N). A malformed id is silently ignored by the merge, so it is rejected here rather than misreported as recorded."
       },
       "resolution": {"type": "string"},
       "reason": {"type": "string"},
