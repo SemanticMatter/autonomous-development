@@ -15,6 +15,8 @@ class ProjectLayoutTests(unittest.TestCase):
         self.assertEqual(manifest["name"], "autonomous-development")
         expected = {
             "autonomous-feature",
+            "autonomous-current",
+            "autonomous-main",
             "enhance-idea",
             "implementation-plan",
             "implement-plan",
@@ -84,6 +86,66 @@ class ProjectLayoutTests(unittest.TestCase):
                 re.findall(r"\{\{([A-Z0-9_]+)\}\}", path.read_text(encoding="utf-8"))
             )
             self.assertTrue(placeholders <= known, f"{path}: {placeholders - known}")
+
+    def test_autonomous_feature_skill_mentions_worktree_modes(self) -> None:
+        text = (ROOT / "skills" / "autonomous-feature" / "SKILL.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("--worktree-mode isolated", text)
+        self.assertIn("--worktree-mode current", text)
+        self.assertIn("EnterWorktree", text)
+        self.assertIn("current-checkout mode", text)
+
+    def test_autonomous_current_skill_uses_current_mode_without_worktree(self) -> None:
+        text = (ROOT / "skills" / "autonomous-current" / "SKILL.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("--mode standard", text)
+        self.assertIn("--worktree-mode current", text)
+        self.assertNotIn("--allow-main", text)
+        # Must NOT enter a disposable worktree.
+        self.assertIn("EnterWorktree", text)  # mentioned only to disallow it
+        # The frontmatter explicitly disallows the worktree tools.
+        head = text.split("---", 2)[1]
+        self.assertIn("EnterWorktree", head)
+        self.assertIn("ExitWorktree", head)
+        # Disallows main/master.
+        self.assertIn("main", text)
+        self.assertIn("master", text)
+        # Never commits.
+        self.assertIn("Do not create commits", text)
+        # Does not create .claude/worktrees/*.
+        self.assertIn(".claude/worktrees", text)
+
+    def test_autonomous_main_skill_passes_allow_main(self) -> None:
+        text = (ROOT / "skills" / "autonomous-main" / "SKILL.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("--mode standard", text)
+        self.assertIn("--worktree-mode current", text)
+        self.assertIn("--allow-main", text)
+        # Must NOT enter a disposable worktree.
+        head = text.split("---", 2)[1]
+        self.assertIn("EnterWorktree", head)
+        self.assertIn("ExitWorktree", head)
+        # Never commits.
+        self.assertIn("Do not create commits", text)
+        # Still requires a clean tree.
+        self.assertIn("clean working tree", text)
+        # Does not create .claude/worktrees/*.
+        self.assertIn(".claude/worktrees", text)
+
+    def test_autonomous_feature_skill_remains_isolated_default(self) -> None:
+        text = (ROOT / "skills" / "autonomous-feature" / "SKILL.md").read_text(
+            encoding="utf-8"
+        )
+        # The default invocation must keep the isolated worktree default.
+        self.assertIn("--worktree-mode isolated", text)
+        # And the frontmatter must still allow EnterWorktree/ExitWorktree so the
+        # default workflow can enter a disposable worktree.
+        head = text.split("---", 2)[1]
+        self.assertIn("EnterWorktree", head)
+        self.assertIn("ExitWorktree", head)
 
 
 if __name__ == "__main__":

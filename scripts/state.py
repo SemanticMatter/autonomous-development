@@ -622,6 +622,7 @@ def migrate_v1_to_v2(
         "id": repo.id,
         "display_name": repo.display_name,
         "canonical_root": str(repo.canonical_root),
+        "worktree_mode": "isolated",
         "remote_display": repo.remote_display,
     }
 

@@ -93,6 +93,7 @@ PHASE_PROFILES: dict[str, dict[str, str]] = {
 _DEFAULT_PROFILE = {"reasoning": "high", "verbosity": "low", "reasoning_summary": "none"}
 
 WORKFLOW_MODES = ("auto", "lean", "standard", "rigorous")
+WORKTREE_MODES = ("isolated", "current")
 
 # Conservative risk categories used by `--mode auto` escalation. Matching any
 # category escalates an `auto` run to rigorous.
@@ -512,6 +513,32 @@ def select_mode(requested: str, feature: str) -> tuple[str, list[str]]:
             ]
         return "standard", ["auto selected standard: no high-risk signals detected"]
     return requested, [f"explicit mode requested: {requested}"]
+
+
+def worktree_mode_label(worktree_mode: object) -> str:
+    """Human-readable label for the init worktree mode."""
+    if worktree_mode == "current":
+        return "current checkout"
+    if worktree_mode == "isolated":
+        return "isolated worktree"
+    if isinstance(worktree_mode, str) and worktree_mode.strip():
+        return worktree_mode.strip()
+    return "(unknown)"
+
+
+def repository_state_block(repo: RepoInfo, *, worktree_mode: str | None = None) -> dict[str, str]:
+    """Return the repository block written into run-state.json."""
+    block = {
+        "id": repo.id,
+        "canonical_root": str(repo.canonical_root),
+        "git_common_dir": str(repo.git_common_dir),
+        "worktree_path": str(repo.worktree_path),
+        "display_name": repo.display_name,
+        "remote_display": repo.remote_display,
+    }
+    if worktree_mode:
+        block["worktree_mode"] = worktree_mode
+    return block
 
 
 # ---------------------------------------------------------------------------
@@ -1306,6 +1333,12 @@ def cmd_init(args: argparse.Namespace) -> int:
     if not feature:
         raise WorkflowError("Feature idea must not be empty")
 
+    worktree_mode = getattr(args, "worktree_mode", "isolated")
+    if getattr(args, "allow_main", False) and worktree_mode != "current":
+        raise WorkflowError(
+            "--allow-main is only valid with --worktree-mode current."
+        )
+
     label = ""
     if getattr(args, "label", None):
         raw_label = args.label.strip()
@@ -1362,17 +1395,37 @@ def cmd_init(args: argparse.Namespace) -> int:
                 )
             run_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
 
-            ctx_text = repository_context(repo)
-            (run_dir / "feature-request.md").write_text(
-                feature + "\n", encoding="utf-8"
-            )
-            (run_dir / "repository-context.txt").write_text(
-                ctx_text, encoding="utf-8"
-            )
-
             dirty = git(
-                repo.canonical_root, "status", "--short", check=False
+                repo.canonical_root, "status", "--porcelain", check=False
             ).splitlines()
+            if worktree_mode == "current":
+                if not repo.branch:
+                    raise WorkflowError(
+                        "Current-checkout mode does not support detached HEAD. "
+                        "Check out a named branch before initializing."
+                    )
+                if repo.branch in {"main", "master"} and not getattr(args, "allow_main", False):
+                    raise WorkflowError(
+                        "Current-checkout mode refuses to initialize on "
+                        f"branch {repo.branch!r}. Create and check out a feature "
+                        "branch first, or pass --allow-main to override this guard "
+                        "on main/master."
+                    )
+                if dirty:
+                    preview = ", ".join(dirty[:5])
+                    suffix = "" if len(dirty) <= 5 else f" (+{len(dirty) - 5} more)"
+                    raise WorkflowError(
+                        "Current-checkout mode requires a clean working tree. "
+                        "Modified, staged, deleted, and untracked files all make "
+                        "the working tree unclean. "
+                        f"Dirty entries: {preview}{suffix}"
+                    )
+
+            ctx_text = repository_context(repo) + (
+                f"\nWorktree mode: {worktree_mode_label(worktree_mode)}\n"
+            )
+            (run_dir / "feature-request.md").write_text(feature + "\n", encoding="utf-8")
+            (run_dir / "repository-context.txt").write_text(ctx_text, encoding="utf-8")
 
             requested_mode = getattr(args, "mode", "auto")
             effective_mode, mode_reasons = select_mode(requested_mode, feature)
@@ -1393,14 +1446,7 @@ def cmd_init(args: argparse.Namespace) -> int:
                 "phase": "initialized",
                 "created_at": utc_now(),
                 "updated_at": utc_now(),
-                "repository": {
-                    "id": repo.id,
-                    "canonical_root": str(repo.canonical_root),
-                    "git_common_dir": str(repo.git_common_dir),
-                    "worktree_path": str(repo.worktree_path),
-                    "display_name": repo.display_name,
-                    "remote_display": repo.remote_display,
-                },
+                "repository": repository_state_block(repo, worktree_mode=worktree_mode),
                 "baseline": {
                     "commit": repo.head_commit,
                     "branch": repo.branch,
@@ -2635,6 +2681,10 @@ def cmd_status(args: argparse.Namespace) -> int:
     print(f"Status: {state.get('status')}")
     print(f"Phase: {state.get('phase')}")
     print(f"Feature: {state.get('feature')}")
+    repo_block = state.get("repository", {})
+    worktree_mode = repo_block.get("worktree_mode") if isinstance(repo_block, dict) else None
+    if worktree_mode:
+        print(f"Worktree mode: {worktree_mode_label(worktree_mode)}")
     print(f"Baseline: {state.get('baseline', {}).get('commit')}")
     print(f"Verification: {passed}/{len(checks)} passing")
     print(
@@ -2959,15 +3009,11 @@ def cmd_accept_drift(args: argparse.Namespace) -> int:
         require_active_run_state(state, run_ref.run_id, "accept-drift")
         old_baseline = dict(state.get("baseline", {}))
         old_repo_block = dict(state.get("repository", {}))
+        old_worktree_mode = old_repo_block.get("worktree_mode")
 
-        state["repository"] = {
-            "id": repo.id,
-            "canonical_root": str(repo.canonical_root),
-            "git_common_dir": str(repo.git_common_dir),
-            "worktree_path": str(repo.worktree_path),
-            "display_name": repo.display_name,
-            "remote_display": repo.remote_display,
-        }
+        state["repository"] = repository_state_block(
+            repo, worktree_mode=old_worktree_mode if isinstance(old_worktree_mode, str) else None
+        )
         state["baseline"] = {
             "commit": repo.head_commit,
             "branch": repo.branch,
@@ -3239,6 +3285,17 @@ def build_parser() -> argparse.ArgumentParser:
         choices=WORKFLOW_MODES,
         default="auto",
         help="Workflow rigor mode; auto escalates conservatively by risk",
+    )
+    init.add_argument(
+        "--worktree-mode",
+        choices=WORKTREE_MODES,
+        default="isolated",
+        help="Repository execution mode; isolated stays in a disposable worktree, current uses the current checkout",
+    )
+    init.add_argument(
+        "--allow-main",
+        action="store_true",
+        help="Allow current-checkout mode on main/master (still requires a clean tree)",
     )
     init.add_argument("--max-review-rounds", type=int, default=3, choices=range(1, 6))
     init.add_argument("--reuse", action="store_true")

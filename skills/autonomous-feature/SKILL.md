@@ -53,17 +53,29 @@ lives in `references/` and is loaded only when a phase needs it.
 
 1. Confirm this is a Git repository. Inspect `CLAUDE.md`, repository instructions, architecture,
    status, and tests. Use `EnterWorktree` for an isolated worktree whenever available — mandatory
-   when the starting worktree has uncommitted changes.
+   when the starting worktree has uncommitted changes. If the user explicitly asks for
+   current-checkout mode, stay in the current branch instead of entering a worktree, and require a
+   clean feature branch before proceeding.
 2. Initialize:
 
    ```bash
    python3 "${CLAUDE_PLUGIN_ROOT}/scripts/controller.py" doctor
-   python3 "${CLAUDE_PLUGIN_ROOT}/scripts/controller.py" init --feature "$ARGUMENTS" --mode auto
+   python3 "${CLAUDE_PLUGIN_ROOT}/scripts/controller.py" init --feature "$ARGUMENTS" --mode auto --worktree-mode isolated
    ```
 
    `init` prints the `run-state.json` path and run ID. With multiple concurrent runs, pass
    `--run-id <run-id>` to all subsequent commands. If `doctor` reports a missing prerequisite, mark
    the run blocked and report it rather than bypassing it.
+
+   For current-checkout mode, do not call `EnterWorktree`. Instead, keep the current branch checked
+   out and run:
+
+   ```bash
+   python3 "${CLAUDE_PLUGIN_ROOT}/scripts/controller.py" init --feature "$ARGUMENTS" --mode auto --worktree-mode current
+   ```
+
+   The controller refuses `main`/`master` unless the user also passes `--allow-main`, and it
+   refuses a dirty tree in current-checkout mode.
 
 3. Repeatedly ask the controller for the next phase, then execute it:
 
