@@ -25,6 +25,7 @@ class ProjectLayoutTests(unittest.TestCase):
             "adversarial-review",
             "fix-findings",
             "autonomous-status",
+            "review-existing-pr",
         }
         actual = {path.parent.name for path in (ROOT / "skills").glob("*/SKILL.md")}
         self.assertEqual(actual, expected)
@@ -63,6 +64,37 @@ class ProjectLayoutTests(unittest.TestCase):
             schema = json.loads(path.read_text(encoding="utf-8"))
             self.assertEqual(violations(schema, "(root)"), [], f"{name}: {path}")
 
+    def test_output_schemas_have_no_unsupported_keywords(self) -> None:
+        """Codex --output-schema objects must not use JSON Schema keywords that
+        OpenAI/Azure strict structured outputs reject. `uniqueItems` in
+        particular is refused by the Azure response_format validator
+        ("'uniqueItems' is not permitted"), which silently breaks the phase."""
+
+        unsupported = {"uniqueItems"}
+
+        def offending(node: object, path: str) -> list[str]:
+            found: list[str] = []
+            if isinstance(node, dict):
+                for key, value in node.items():
+                    if key in unsupported:
+                        found.append(f"{path}/{key}")
+                    found += offending(value, f"{path}/{key}")
+            elif isinstance(node, list):
+                for index, value in enumerate(node):
+                    found += offending(value, f"{path}[{index}]")
+            return found
+
+        for name in (
+            "enhanced-idea",
+            "implementation-plan",
+            "review",
+            "review-delta",
+            "adversarial-review",
+        ):
+            path = ROOT / "schemas" / f"{name}.schema.json"
+            schema = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(offending(schema, "(root)"), [], f"{name}: {path}")
+
     def test_prompt_placeholders_are_known(self) -> None:
         known = {
             "FEATURE",
@@ -76,6 +108,8 @@ class ProjectLayoutTests(unittest.TestCase):
             "LATEST_REVIEW",
             "FINDING_LEDGER",
             "OPEN_FINDINGS",
+            # F39: the adversarial threat-ledger analogue of OPEN_FINDINGS.
+            "PRIOR_THREATS",
             "ACCEPTANCE_CRITERIA",
             "CHANGED_SINCE_LAST_REVIEW",
         }

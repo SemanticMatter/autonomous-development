@@ -9,7 +9,6 @@
     "summary": {"type": "string"},
     "resolved_findings": {
       "type": "array",
-      "uniqueItems": true,
       "items": {"type": "string", "pattern": "^F-[0-9]+$"}
     },
     "new_findings": {

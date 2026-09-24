@@ -1,0 +1,24 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "autonomous-development",
+  "description": "Local marketplace for the Autonomous Claude + Codex Development plugin.",
+  "owner": {
+    "name": "Thomas Hagelien"
+  },
+  "plugins": [
+    {
+      "name": "autonomous-development",
+      "source": "./",
+      "description": "A bounded autonomous feature-development workflow in which Claude orchestrates implementation and Codex independently enhances, plans, and reviews the work.",
+      "version": "0.3.0",
+      "category": "development",
+      "keywords": [
+        "claude-code",
+        "codex",
+        "autonomous-development",
+        "code-review",
+        "implementation-planning"
+      ]
+    }
+  ]
+}

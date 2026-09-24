@@ -35,6 +35,64 @@ For a high-risk feature:
 /autonomous-development:adversarial-review "The change modifies authorization and persistent access-token storage"
 ```
 
+## Reviewing an existing PR or branch
+
+```text
+/autonomous-development:review-existing-pr "Review the checked-out feature branch against main"
+```
+
+Local diff-only review (offline, no metadata, no GitHub API):
+
+```bash
+git switch my-feature-branch
+controller.py import-pr --target-ref my-feature-branch --base-ref main
+controller.py codex --phase review
+controller.py evaluate
+controller.py status
+```
+
+Review with PR/issue and imported CI metadata files:
+
+```bash
+# pr.json conforms to schemas/pr-metadata.schema.json
+# ci.json conforms to schemas/imported-verification.schema.json (external provenance)
+controller.py import-pr --target-ref my-feature-branch --base-ref origin/main \
+  --metadata-file pr.json --verification-file ci.json
+controller.py codex --phase review
+# Imported CI is recorded as external evidence; missing/failed/stale evidence is
+# reported as a verification gap and never counts as a local run-check.
+controller.py evaluate
+```
+
+High-risk PR that triggers an adversarial review:
+
+```bash
+# A diff touching auth/migrations/etc. sets risk.requires_adversarial_review.
+controller.py import-pr --target-ref add-auth-and-migration --base-ref main \
+  --description "Adds login/session handling and a DB migration"
+controller.py codex --phase review
+controller.py codex --phase adversarial   # required before evaluate can complete
+controller.py evaluate
+```
+
+The workflow is strictly read-only against the target repository: no commits,
+pushes, merges, rebases, branch deletions, or remote changes occur. If the target
+branch/HEAD changes after import, re-import with `--refresh`. `--run-id` is a
+global option and must precede the `import-pr` subcommand:
+
+```bash
+controller.py --run-id <run-id> import-pr --refresh \
+  --target-ref my-feature-branch --base-ref main
+# Add --base-mode exact when the original import used a non-default base mode.
+#
+# A refresh is STATELESS: it rebuilds PR metadata and imported CI evidence from its
+# own argv. Re-supply everything the original import carried, or it is dropped:
+controller.py --run-id <run-id> import-pr --refresh \
+  --target-ref my-feature-branch --base-ref main \
+  --description-file /tmp/pr-description.txt \
+  --verification-file /tmp/ci.json --trust-verification
+```
+
 ## Controller modes and reporting
 
 `auto` mode (the default) scales the workflow to the change and escalates conservatively:
