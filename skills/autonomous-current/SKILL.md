@@ -79,6 +79,9 @@ directly in that branch — no disposable worktree, no `.claude/worktrees/*` clo
    `--run-id <run-id>` to all subsequent commands. If `doctor` reports a missing prerequisite,
    mark the run blocked and report it rather than bypassing it.
 
+   The run is pinned to this checkout and records that direct edits on `main`/`master` were not
+   authorized, so `accept-drift` refuses to move it onto `main`/`master` or into another worktree.
+
 3. Repeatedly ask the controller for the next phase, then execute it:
 
    ```bash

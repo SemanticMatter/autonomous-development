@@ -32,9 +32,9 @@ The plugin deliberately keeps Claude as the implementation orchestrator and uses
 
 Both current-checkout **implementation** workflows (`autonomous-current` and `autonomous-main`) are opt-in. They do not create `.claude/worktrees/*`, do not enter a worktree, and never commit — the user reviews with normal `git diff` and commits manually. They require a clean working tree (`git status --porcelain` must be empty): modified, staged, deleted, and untracked files all make it unclean. They also require an attached named branch; detached HEAD is unsupported. `--allow-main` is valid only with `--worktree-mode current`; `autonomous-current` refuses `main`/`master`, while `autonomous-main` passes `--allow-main` to bypass that guard. `review-existing-pr` also runs in the current checkout and likewise requires a clean tree, but it is strictly read-only: it never edits, commits, or enters a worktree, and it works on `main`/`master` or a detached HEAD without `--allow-main` because it only reads the diff.
 
-## Upstream
+## Repository
 
-This plugin is based on [quaat/autonomous-development](https://github.com/quaat/autonomous-development). This fork keeps the original workflow and adds the current-checkout mode and the read-only existing-PR review workflow (`review-existing-pr`/`import-pr`), plus related documentation updates.
+The canonical repository is [SemanticMatter/autonomous-development](https://github.com/SemanticMatter/autonomous-development). Links to its former name, `quaat/autonomous-development`, redirect there. It contains the original workflow plus the current-checkout mode and the read-only existing-PR review workflow (`review-existing-pr`/`import-pr`).
 
 ## Included skills
 
@@ -542,7 +542,7 @@ any mutating command. Two kinds of drift are distinguished:
 
 - **EXPECTED**: HEAD has advanced on the same branch (commits were added). No action required.
 - **UNSAFE**: Branch changed, worktree path changed, or repository identity changed. Mutating
-  commands are blocked until the drift is acknowledged.
+  commands are blocked until the drift is resolved.
 
 ```bash
 # If an unsafe drift is detected (e.g., branch changed), you will see:
@@ -551,6 +551,19 @@ any mutating command. Two kinds of drift are distinguished:
 
 controller.py accept-drift
 ```
+
+`accept-drift` is a recovery for feature runs only, and it re-applies the feature run's own
+guards instead of trusting the new state:
+
+- It refuses existing-PR review runs (use `import-pr --refresh`; see above) and any workflow kind
+  this controller does not know.
+- It never re-binds a run to another worktree. Run it from the run's originating worktree, or
+  start a new run. A branch change inside that worktree is the drift it can accept.
+- For a current-checkout run, it requires an attached, clean checkout (commit or stash first) and
+  re-applies the `main`/`master` refusal using the `--allow-main` authorization persisted at
+  `init`. It has no `--allow-main` option: a run initialized without that authorization cannot be
+  moved onto `main`/`master`, and a run created before the authorization was persisted is treated
+  as unauthorized.
 
 ## Archiving runs
 
@@ -610,11 +623,47 @@ All commands still work correctly from any linked worktree. The repository ident
 from the shared git object store so runs created in different worktrees belong to the same
 repository and are visible to `list-runs`. Current-checkout mode is opt-in for people who create
 their own feature branches first and want the agent's changes to land directly in that checkout.
-In current mode the controller uses the current project root for both
-`repository.canonical_root` and `repository.worktree_path`, records the current branch in
-baseline metadata, does not create a `.claude/worktrees/*` worktree or `worktree-*` branch,
-refuses detached HEAD and `main`/`master` unless you pass `--allow-main`, and refuses a
-dirty tree containing modified, staged, deleted, or untracked files.
+In current mode the controller records the current branch in baseline metadata, does not create a
+`.claude/worktrees/*` worktree or `worktree-*` branch, refuses detached HEAD and `main`/`master`
+unless you pass `--allow-main`, and refuses a dirty tree containing modified, staged, deleted, or
+untracked files. A Git error while inspecting the checkout is a refusal, never a clean result.
+
+### Run identity and workflow isolation
+
+- **Worktree identity is pinned.** In both modes `init` records the resolved worktree it ran in
+  (the invoking checkout's top level, as `repository.worktree_path` and the pinned
+  `baseline.worktree_path`). The repository id is shared by all linked worktrees; the pinned path
+  identifies the one checkout a run belongs to. Mutating commands from another worktree are UNSAFE
+  drift, and `accept-drift` does not re-bind the run.
+- **`worktree_mode` is descriptive.** `repository.worktree_mode` records where a run operates.
+  It is not an authorization: each workflow's own guards decide what is permitted.
+- **`--allow-main` is a feature-only, persisted authorization.** `init` records it as
+  `feature_authorization.allow_main` (always `false` for isolated runs). It is never inferred from
+  the branch, the command line, or the skill, and no other workflow uses it.
+- **Workflow kind is explicit.** New feature runs record `workflow_kind: "feature"`; imported
+  reviews record `existing_pr_review`. Runs that record no kind are treated as feature runs only
+  when nothing marks them as imported. Any other kind is unknown and refused by the paths below.
+- **`init --reuse`** adopts only an active feature run of this repository whose recorded
+  worktree mode matches the request; a current-checkout run must also be pinned to the invoking
+  worktree. It never adopts an imported review, an unknown kind, or a run of the other mode, and
+  it never changes a run to make it compatible. Repeat the request with the run's own
+  `--worktree-mode` from its own worktree, or pass `--force` to start an additional run.
+- **The Stop hook** attached to the feature skills acts only on the single active feature run
+  pinned to the session's worktree. It ignores imported reviews, unknown kinds, runs pinned to
+  another worktree or recorded for another repository, and terminal runs. With several applicable
+  runs it does not guess and exits without blocking.
+- **Imported reviews stay read-only.** `review-existing-pr` records `worktree_mode: "current"`,
+  rejects `--allow-main`, keeps its own stricter drift rules, and is refused by the feature
+  `accept-drift` and ignored by the feature Stop hook.
+- **Older runs.** A run created before these fields existed stays readable. Its originating
+  worktree is taken from `repository.worktree_path`, which `init` has always recorded; a missing
+  worktree mode reads as isolated; a missing `--allow-main` authorization reads as not granted.
+  Mutating commands compare the worktree only for runs that record the pin (every run `init`
+  creates now, and any run after `accept-drift`). A recovery that needs an identity or
+  authorization the run does not record fails closed.
+- **Future workflows** must define their own branch and drift policies. The shared
+  attached-clean-checkout guard contains no branch policy and no bypass, and neither `--allow-main`
+  nor `accept-drift` extends to another workflow kind.
 
 ## Completion rules
 
@@ -639,7 +688,7 @@ The skill uses Codex with `--sandbox read-only`. Claude performs repository edit
 - deleting unrelated user changes;
 - weakening tests or security controls to obtain a passing result.
 
-By default, run autonomous development in an isolated worktree. This fork also supports an explicit current-checkout mode when you want changes to land directly in your own feature branch.
+By default, run autonomous development in an isolated worktree. The plugin also supports an explicit current-checkout mode when you want changes to land directly in your own feature branch.
 
 ## Customization
 

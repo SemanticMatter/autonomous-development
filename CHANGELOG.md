@@ -2,6 +2,53 @@
 
 ## Unreleased
 
+### Workflow isolation and drift guards (issue #6)
+
+Shared entry points written when "not imported" meant "feature" now select
+their workflow explicitly, and the current-checkout guards fail closed.
+
+Fixed:
+- **The Stop hook acted on unrelated runs.** It blocked the repository's sole
+  active run whatever its kind or worktree, and after three blocks moved an
+  `existing_pr_review` run to `blocked`. It now acts only on the single active
+  feature run pinned to the session's worktree. Imported reviews, unknown kinds,
+  runs pinned to other worktrees or recorded for another repository, and terminal
+  runs are left byte-identical.
+- **`init --reuse` adopted any sole active run**, including an imported review, a
+  run of the other worktree mode, or a current-checkout run from another
+  worktree. It now adopts only a compatible active feature run and otherwise
+  refuses with the reasons (or, with `--force`, starts a new run as before).
+- **`accept-drift` bypassed the current-checkout guards.** It refused only
+  imported runs, so it accepted unknown kinds and could re-baseline a
+  current-checkout run onto `main`/`master`, a detached HEAD, a dirty tree, or
+  another worktree. It is now feature-only, never re-binds a run to another
+  worktree, and for current-checkout runs re-runs the attached-clean-checkout
+  guard and the `main`/`master` refusal with the persisted authorization.
+- **The current-checkout dirty check failed open.** A failing `git status` read
+  as a clean tree. The new `require_attached_clean_checkout` guard fails closed
+  on every Git error and on unexpected output, and holds no branch policy.
+- **Feature runs did not pin their worktree.** `init` now records
+  `baseline.worktree_path`, so mutating commands from another worktree are
+  UNSAFE drift.
+
+Added:
+- `run_workflow_kind()`, the authoritative workflow-kind classifier (`feature`,
+  `existing_pr_review`, or `unknown`). New feature runs record
+  `workflow_kind: "feature"`; `is_imported_run()` keeps its broader read-only
+  guard.
+- `feature_authorization.allow_main` records the feature-only `--allow-main`
+  authorization at `init`. It is never inferred, and no other workflow uses it.
+
+Compatibility:
+- Runs that predate these fields stay readable and are not rewritten. A missing
+  kind reads as feature unless a `review_target` is present, a missing worktree
+  mode reads as isolated, the originating worktree falls back to
+  `repository.worktree_path`, and a missing `--allow-main` authorization reads as
+  not granted. Recoveries that need an unrecorded identity fail closed. The
+  state schema version is unchanged.
+- `worktree_mode` stays a descriptive location. The feature branch policy is
+  still the literal `main`/`master` set.
+
 ### Review round 12 — fixes from the twelfth review (both tracks, PR #4)
 
 Both tracks verified every round-10 and round-11 fix, including against probes
