@@ -18,6 +18,7 @@ import tempfile
 import threading
 import time
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
 from urllib.parse import urlsplit, urlunsplit
@@ -67,6 +68,13 @@ from state import (
     split_nul_fields,
     _sanitized_path,
     LEGACY_STATE_REL,
+    WORKFLOW_KIND_EXISTING_PR_REVIEW,
+    WORKFLOW_KIND_FEATURE,
+    WORKTREE_MODES,
+    feature_origin_worktree,
+    feature_worktree_mode,
+    recorded_allow_main,
+    run_workflow_kind,
 )
 from schema_validation import SchemaValidationError, validate_payload
 
@@ -110,7 +118,8 @@ PHASE_PROFILES: dict[str, dict[str, str]] = {
 _DEFAULT_PROFILE = {"reasoning": "high", "verbosity": "low", "reasoning_summary": "none"}
 
 WORKFLOW_MODES = ("auto", "lean", "standard", "rigorous")
-WORKTREE_MODES = ("isolated", "current")
+# Branches a current-checkout feature run may use only with persisted --allow-main.
+FEATURE_PROTECTED_BRANCHES: frozenset[str] = frozenset({"main", "master"})
 
 # Conservative risk categories used by `--mode auto` escalation. Matching any
 # category escalates an `auto` run to rigorous.
@@ -327,8 +336,7 @@ def require_no_unsafe_drift(state: dict, repo: RepoInfo) -> None:
     if drift.kind == DriftKind.UNSAFE:
         raise WorkflowError(
             f"Unsafe repository drift detected: {drift.message}\n"
-            f"Recovery: {drift.recovery}\n"
-            f"Use `accept-drift` to record the new baseline when safe."
+            f"Recovery: {drift.recovery}"
         )
 
 
@@ -2058,6 +2066,104 @@ def _ref_is_checked_out_head(root: Path, target_head: str) -> bool:
 def _current_branch(root: Path) -> str:
     """The currently checked-out branch name, or '' when HEAD is detached."""
     return _git_ro(root, "rev-parse", "--abbrev-ref", "HEAD").strip().strip('"') or ""
+
+
+@dataclass(frozen=True)
+class CheckoutIdentity:
+    """Checkout identity verified by `require_attached_clean_checkout`."""
+
+    worktree_path: Path
+    branch: str
+    head_commit: str
+
+
+def require_attached_clean_checkout(repo: RepoInfo, *, context: str) -> CheckoutIdentity:
+    """Verify that `repo` is an attached, clean checkout, failing closed.
+
+    Shared guard for workflows that operate directly in the invoking checkout.
+    It re-reads the checkout with hardened, read-only git calls that must all
+    succeed, and refuses unless:
+
+    * `rev-parse --show-toplevel` resolves to `repo.worktree_path`;
+    * `rev-parse --verify HEAD` resolves to `repo.head_commit`;
+    * `branch --show-current` names a branch (an empty result is a detached
+      HEAD) that equals `repo.branch`;
+    * `status --porcelain --untracked-files=normal --ignore-submodules=none`
+      reports no entries, so modified, staged, deleted, and untracked files and
+      modified submodules all make the checkout unclean (ignored files do not).
+      The flags override repository config such as `status.showUntrackedFiles`
+      and `diff.ignoreSubmodules` that would otherwise hide entries.
+
+    A git failure, missing or malformed output, or a checkout that changed since
+    `repo` was resolved is a refusal and is never read as a clean or attached
+    checkout. The guard applies no branch policy and has no bypass: callers apply
+    their own workflow-specific branch policy to the returned identity. `context`
+    names the caller in refusal messages.
+    """
+    root = repo.worktree_path
+    try:
+        toplevel = _git_ro(root, "rev-parse", "--show-toplevel", check=True)
+        head = _git_ro(root, "rev-parse", "--verify", "HEAD", check=True)
+        branch = _git_ro(root, "branch", "--show-current", check=True)
+        status = _git_ro(
+            root, "status", "--porcelain", "--untracked-files=normal",
+            "--ignore-submodules=none", check=True,
+        )
+    except (WorkflowError, StateError) as exc:
+        raise WorkflowError(
+            f"{context} could not inspect the checkout: {exc}. A failed Git "
+            "inspection is never treated as a clean, attached checkout; resolve "
+            "the Git error and retry."
+        ) from exc
+    if not toplevel or Path(toplevel).resolve() != repo.worktree_path:
+        raise WorkflowError(
+            f"{context} could not verify the worktree: Git reported "
+            f"{toplevel!r} but the resolved worktree is {str(repo.worktree_path)!r}."
+        )
+    if not head or head != repo.head_commit:
+        raise WorkflowError(
+            f"{context} could not verify HEAD: it changed or could not be read "
+            "during inspection. Retry once the checkout is stable."
+        )
+    if not branch:
+        raise WorkflowError(
+            f"{context} does not support detached HEAD. Check out a named branch "
+            "and retry."
+        )
+    if any(ch.isspace() for ch in branch) or branch != repo.branch:
+        raise WorkflowError(
+            f"{context} could not verify the current branch: Git reported "
+            f"{branch!r} but the resolved branch is {repo.branch!r}."
+        )
+    dirty = status.splitlines()
+    if dirty:
+        preview = ", ".join(dirty[:5])
+        suffix = "" if len(dirty) <= 5 else f" (+{len(dirty) - 5} more)"
+        raise WorkflowError(
+            f"{context} requires a clean working tree. Modified, staged, deleted, "
+            "and untracked files all make the working tree unclean. "
+            f"Dirty entries: {preview}{suffix}. Commit or stash these changes, "
+            "then retry."
+        )
+    return CheckoutIdentity(worktree_path=repo.worktree_path, branch=branch, head_commit=head)
+
+
+def require_feature_branch_allowed(
+    branch: str, *, allow_main: bool, operation: str, recovery: str
+) -> None:
+    """Apply the feature workflow's current-checkout branch policy.
+
+    Refuses `FEATURE_PROTECTED_BRANCHES` unless `allow_main` is the run's
+    explicit feature-only `--allow-main` authorization: the flag at `init`, or
+    the value persisted by `init` when `accept-drift` re-checks the branch. The
+    repository's actual default branch is not resolved. `operation` completes
+    "refuses to ... branch <name>" and `recovery` tells the user what to do.
+    """
+    if branch in FEATURE_PROTECTED_BRANCHES and not allow_main:
+        raise WorkflowError(
+            f"Current-checkout mode refuses to {operation} branch {branch!r}. "
+            f"{recovery}"
+        )
 
 
 # Namespaces a short ref name can live in. If a name resolves in more than one of
@@ -5053,6 +5159,50 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 
 
+def _unsupported_kind_reason(state: Mapping[str, Any]) -> str:
+    """Describe a run whose workflow kind is not the feature workflow."""
+    if run_workflow_kind(state) == WORKFLOW_KIND_EXISTING_PR_REVIEW:
+        return "it is a read-only existing-PR review run"
+    return (
+        f"its workflow kind {state.get('workflow_kind', '(unrecorded)')!r} is not "
+        "a feature workflow this controller supports"
+    )
+
+
+def feature_reuse_incompatibility(
+    state: dict[str, Any], *, worktree_mode: str, repo: RepoInfo
+) -> str | None:
+    """Return why `init --reuse` must not adopt `state`, or None if it may.
+
+    A run is compatible only when it is an active feature run of this
+    repository whose recorded worktree mode equals the requested one and that
+    is pinned to the invoking worktree, in either mode: a run pinned elsewhere
+    would fail every later mutating command with worktree drift. Nothing is
+    mutated, so an incompatible run is never made compatible.
+    """
+    if run_workflow_kind(state) != WORKFLOW_KIND_FEATURE:
+        return _unsupported_kind_reason(state)
+    if state.get("status") != "active":
+        return f"its status is {state.get('status')!r}, not 'active'"
+    repo_block = state.get("repository", {})
+    if not isinstance(repo_block, dict) or repo_block.get("id") != repo.id:
+        return "it does not record this repository's id"
+    recorded_mode = feature_worktree_mode(state)
+    if recorded_mode is None:
+        return "its recorded worktree mode is malformed"
+    if recorded_mode != worktree_mode:
+        return (
+            f"it runs in {worktree_mode_label(recorded_mode)} mode, not "
+            f"{worktree_mode_label(worktree_mode)} mode"
+        )
+    origin = feature_origin_worktree(state)
+    if origin is None:
+        return "it records no valid originating worktree"
+    if origin != str(repo.worktree_path):
+        return f"it is pinned to worktree {origin!r}"
+    return None
+
+
 def cmd_init(args: argparse.Namespace) -> int:
     repo, state_home, run_id_override = get_context(args)
 
@@ -5066,7 +5216,8 @@ def cmd_init(args: argparse.Namespace) -> int:
         raise WorkflowError("Feature idea must not be empty")
 
     worktree_mode = getattr(args, "worktree_mode", "isolated")
-    if getattr(args, "allow_main", False) and worktree_mode != "current":
+    allow_main = bool(getattr(args, "allow_main", False))
+    if allow_main and worktree_mode != "current":
         raise WorkflowError(
             "--allow-main is only valid with --worktree-mode current."
         )
@@ -5084,18 +5235,41 @@ def cmd_init(args: argparse.Namespace) -> int:
 
         if active_runs:
             if args.reuse:
-                if len(active_runs) > 1:
-                    ids = ", ".join(r.run_id for r in active_runs)
+                compatible = []
+                refused: list[str] = []
+                candidates = active_runs
+                if run_id_override:
+                    # An explicit --run-id selects exactly that run; never another one.
+                    candidates = [r for r in active_runs if r.run_id == run_id_override]
+                    if not candidates:
+                        refused.append(f"{run_id_override}: no active run has this ID")
+                for candidate in candidates:
+                    reason = feature_reuse_incompatibility(
+                        candidate.state, worktree_mode=worktree_mode, repo=repo
+                    )
+                    if reason is None:
+                        compatible.append(candidate)
+                    else:
+                        refused.append(f"{candidate.run_id}: {reason}")
+                if len(compatible) > 1:
+                    ids = ", ".join(r.run_id for r in compatible)
                     raise WorkflowError(
                         f"Multiple active runs exist: {ids}. "
                         "Use --run-id to select one explicitly."
                     )
-                run_ref = active_runs[0]
-                run_dir = run_ref.run_dir
-                state_path = run_dir / "run-state.json"
-                print(state_path)
-                return 0
-            if not args.force:
+                if compatible:
+                    print(compatible[0].run_dir / "run-state.json")
+                    return 0
+                if not args.force:
+                    raise WorkflowError(
+                        "--reuse found no compatible active feature run for this "
+                        f"{worktree_mode_label(worktree_mode)} request in "
+                        f"{str(repo.worktree_path)!r}; incompatible runs are never "
+                        f"adopted ({'; '.join(refused)}). Continue a run from its "
+                        "own worktree with its own --worktree-mode, finish or "
+                        "`cancel` it, or pass --force to start an additional run."
+                    )
+            elif not args.force:
                 ids = ", ".join(r.run_id for r in active_runs)
                 raise WorkflowError(
                     f"Active workflow run(s) already exist: {ids}. "
@@ -5125,31 +5299,24 @@ def cmd_init(args: argparse.Namespace) -> int:
                 )
             run_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
 
-            dirty = git(
-                repo.canonical_root, "status", "--porcelain", check=False
-            ).splitlines()
             if worktree_mode == "current":
-                if not repo.branch:
-                    raise WorkflowError(
-                        "Current-checkout mode does not support detached HEAD. "
-                        "Check out a named branch before initializing."
-                    )
-                if repo.branch in {"main", "master"} and not getattr(args, "allow_main", False):
-                    raise WorkflowError(
-                        "Current-checkout mode refuses to initialize on "
-                        f"branch {repo.branch!r}. Create and check out a feature "
-                        "branch first, or pass --allow-main to override this guard "
-                        "on main/master."
-                    )
-                if dirty:
-                    preview = ", ".join(dirty[:5])
-                    suffix = "" if len(dirty) <= 5 else f" (+{len(dirty) - 5} more)"
-                    raise WorkflowError(
-                        "Current-checkout mode requires a clean working tree. "
-                        "Modified, staged, deleted, and untracked files all make "
-                        "the working tree unclean. "
-                        f"Dirty entries: {preview}{suffix}"
-                    )
+                checkout = require_attached_clean_checkout(
+                    repo, context="Current-checkout mode"
+                )
+                require_feature_branch_allowed(
+                    checkout.branch,
+                    allow_main=allow_main,
+                    operation="initialize on",
+                    recovery=(
+                        "Create and check out a feature branch first, or pass "
+                        "--allow-main to override this guard on main/master."
+                    ),
+                )
+                dirty: list[str] = []
+            else:
+                dirty = git(
+                    repo.canonical_root, "status", "--porcelain", check=False
+                ).splitlines()
 
             # Non-imported runs pass no policy_rev, so base_policy_ok is always
             # True (nothing pinned to fail reading); unpack for the shared signature.
@@ -5171,6 +5338,7 @@ def cmd_init(args: argparse.Namespace) -> int:
             state: dict[str, Any] = {
                 "schema_version": 2,
                 "run_id": run_id,
+                "workflow_kind": WORKFLOW_KIND_FEATURE,
                 "label": label,
                 "feature": feature,
                 "status": "active",
@@ -5181,8 +5349,10 @@ def cmd_init(args: argparse.Namespace) -> int:
                 "baseline": {
                     "commit": repo.head_commit,
                     "branch": repo.branch,
+                    "worktree_path": str(repo.worktree_path),
                     "dirty_entries_at_init": dirty,
                 },
+                "feature_authorization": {"allow_main": allow_main},
                 "requested_mode": requested_mode,
                 "effective_mode": effective_mode,
                 "mode_reasons": mode_reasons,
@@ -8255,6 +8425,90 @@ def cmd_archive_run(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 
 
+def require_feature_drift_acceptable(
+    state: dict[str, Any], repo: RepoInfo, *, run_id: str
+) -> str:
+    """Refuse `accept-drift` unless it may re-baseline this run here.
+
+    `accept-drift` is a feature-workflow recovery only. It refuses existing-PR
+    review runs (their baseline is pinned to the PR base) and every unknown or
+    future workflow kind. For a feature run it requires a recorded worktree
+    mode and the pinned originating worktree, which must equal the invoking
+    worktree: a run is never re-bound to another worktree. A current-checkout
+    run must also pass `require_attached_clean_checkout`, and its branch must
+    satisfy the feature branch policy using the `--allow-main` authorization
+    persisted at `init`; accept-drift can neither add nor infer that
+    authorization. Returns the verified originating worktree path.
+    """
+    kind = run_workflow_kind(state)
+    if kind == WORKFLOW_KIND_EXISTING_PR_REVIEW:
+        # Accepting the current HEAD as an imported baseline would make baseline ==
+        # target HEAD (empty diff, stale pass); imported drift is handled by --refresh.
+        raise WorkflowError(
+            "Refusing accept-drift on an existing-PR review run: its baseline is "
+            "pinned to the PR base commit, and accepting the current HEAD as the "
+            "baseline would make the review diff empty. Target drift for imported "
+            f"reviews is handled by re-running `{_refresh_recovery_command(state)}`."
+        )
+    if kind != WORKFLOW_KIND_FEATURE:
+        raise WorkflowError(
+            f"Refusing accept-drift on run {run_id!r}: {_unsupported_kind_reason(state)}. "
+            "accept-drift re-baselines feature runs only; other workflows define "
+            "their own drift recovery."
+        )
+    worktree_mode = feature_worktree_mode(state)
+    if worktree_mode is None:
+        raise WorkflowError(
+            f"Refusing accept-drift on run {run_id!r}: its recorded worktree mode "
+            "is malformed, so the guards that apply to it cannot be determined. "
+            "Inspect it with `status` and start a new run with `init`."
+        )
+    origin = feature_origin_worktree(state)
+    if origin is None:
+        raise WorkflowError(
+            f"Refusing accept-drift on run {run_id!r}: it records no valid "
+            "originating worktree, so it cannot be verified to belong to this "
+            "checkout. Migrate legacy state with `migrate-legacy-state`, or start "
+            "a new run with `init`."
+        )
+    if origin != str(repo.worktree_path):
+        raise WorkflowError(
+            f"Refusing accept-drift on run {run_id!r}: it is pinned to worktree "
+            f"{origin!r}, but this command runs in {str(repo.worktree_path)!r}. "
+            "accept-drift never re-binds a run to another worktree. Run it from "
+            "the originating worktree (recreate that worktree if it was removed), "
+            "or start a new run here with `init`."
+        )
+    if worktree_mode == "current":
+        checkout = require_attached_clean_checkout(
+            repo, context="accept-drift for a current-checkout run"
+        )
+        allow_main = recorded_allow_main(state)
+        baseline = state.get("baseline")
+        recorded_branch = baseline.get("branch", "") if isinstance(baseline, dict) else ""
+        if allow_main is None:
+            why = (
+                "it records no valid --allow-main authorization (it predates "
+                "persisted authorization, or the field is malformed), so it is "
+                "treated as unauthorized"
+            )
+        else:
+            why = "it was initialized without --allow-main"
+        require_feature_branch_allowed(
+            checkout.branch,
+            allow_main=allow_main is True,
+            operation="accept drift onto",
+            recovery=(
+                f"Run {run_id!r}: {why}, and accept-drift cannot add that "
+                f"authorization. Switch back to branch {recorded_branch!r}, or "
+                "start a new run with --allow-main "
+                "(/autonomous-development:autonomous-main) if direct edits on "
+                "main/master are intended."
+            ),
+        )
+    return origin
+
+
 def cmd_accept_drift(args: argparse.Namespace) -> int:
     repo, state_home, run_id_override = get_context(args)
     run_ref = resolve_run_for_active_mutation(
@@ -8269,15 +8523,7 @@ def cmd_accept_drift(args: argparse.Namespace) -> int:
         state = load_run_state(run_dir)
         verify_loaded_run_identity(state, run_dir=run_dir, expected_repo_id=repo.id)
         require_active_run_state(state, run_ref.run_id, "accept-drift")
-        # accept-drift would set baseline to current HEAD; for an imported review that makes baseline ==
-        # target HEAD (empty diff, stale pass). The imported baseline is pinned to the PR base; use --refresh.
-        if is_imported_run(state):
-            raise WorkflowError(
-                "Refusing accept-drift on an existing-PR review run: its baseline is "
-                "pinned to the PR base commit, and accepting the current HEAD as the "
-                "baseline would make the review diff empty. Target drift for imported "
-                f"reviews is handled by re-running `{_refresh_recovery_command(state)}`."
-            )
+        origin = require_feature_drift_acceptable(state, repo, run_id=run_ref.run_id)
         old_baseline = dict(state.get("baseline", {}))
         old_repo_block = dict(state.get("repository", {}))
         old_worktree_mode = old_repo_block.get("worktree_mode")
@@ -8288,7 +8534,7 @@ def cmd_accept_drift(args: argparse.Namespace) -> int:
         state["baseline"] = {
             "commit": repo.head_commit,
             "branch": repo.branch,
-            "worktree_path": str(repo.worktree_path),
+            "worktree_path": origin,
             "dirty_entries_at_init": old_baseline.get("dirty_entries_at_init", []),
         }
         state.setdefault("notes", []).append(
@@ -8300,15 +8546,10 @@ def cmd_accept_drift(args: argparse.Namespace) -> int:
     print("Drift accepted. Updated baseline:")
     old_commit = old_baseline.get("commit", "(unknown)")
     old_branch = old_baseline.get("branch", "(unknown)")
-    old_worktree = old_baseline.get(
-        "worktree_path", old_repo_block.get("worktree_path", "")
-    )
     if old_commit != repo.head_commit:
         print(f"  commit: {old_commit} -> {repo.head_commit}")
     if old_branch != repo.branch:
         print(f"  branch: {old_branch} -> {repo.branch}")
-    if old_worktree and old_worktree != str(repo.worktree_path):
-        print(f"  worktree: {old_worktree} -> {repo.worktree_path}")
     if old_repo_block.get("id") and old_repo_block["id"] != repo.id:
         print(f'  repo_id: {old_repo_block["id"]} -> {repo.id}')
     return 0

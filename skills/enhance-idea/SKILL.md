@@ -16,6 +16,9 @@ disallowed-tools: AskUserQuestion
 python3 "${CLAUDE_PLUGIN_ROOT}/scripts/controller.py" init --reuse --feature "$ARGUMENTS"
 ```
 
+`--reuse` adopts only a compatible active feature run pinned to this checkout, so run it from the
+run's own worktree. To continue a current-checkout run, also add `--worktree-mode current`.
+
 3. Run the structured read-only Codex phase:
 
 ```bash

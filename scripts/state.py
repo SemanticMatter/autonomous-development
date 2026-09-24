@@ -30,6 +30,16 @@ SUPPORTED_STATE_SCHEMA_VERSIONS: tuple[int, ...] = (1, 2, 3)
 TERMINAL_STATUSES: frozenset[str] = frozenset(
     {"complete", "blocked", "cancelled", "archived"}
 )
+# Workflow kinds this controller understands (see `run_workflow_kind`). Any other
+# recorded kind, including one a newer controller writes, classifies as unknown.
+WORKFLOW_KIND_FEATURE = "feature"
+WORKFLOW_KIND_EXISTING_PR_REVIEW = "existing_pr_review"
+WORKFLOW_KIND_UNKNOWN = "unknown"
+KNOWN_WORKFLOW_KINDS: frozenset[str] = frozenset(
+    {WORKFLOW_KIND_FEATURE, WORKFLOW_KIND_EXISTING_PR_REVIEW}
+)
+# Descriptive location of a run (`repository.worktree_mode`); never an authorization.
+WORKTREE_MODES = ("isolated", "current")
 LEGACY_STATE_REL = Path(".ai/autonomous-development")
 LEGACY_STATE_FILE_NAME = "run-state.json"
 
@@ -1597,6 +1607,110 @@ def resolve_run_for_inspection(
 
 
 # ---------------------------------------------------------------------------
+# Workflow kind and feature-run identity
+# ---------------------------------------------------------------------------
+
+
+def run_workflow_kind(state: object) -> str:
+    """Return the authoritative workflow kind recorded in a run state.
+
+    This is the single classifier for code that selects workflow-specific
+    behavior. It reads only the explicit ``workflow_kind`` field and never infers
+    a kind from incidental fields such as ``worktree_mode`` or review artifacts:
+
+    * ``"feature"`` or ``"existing_pr_review"`` when that kind is recorded;
+    * ``"feature"`` when no kind is recorded and the state carries no
+      ``review_target``, which is the shape of every feature run created before
+      feature runs recorded their kind (including legacy and migrated runs);
+    * ``"unknown"`` for anything else: a non-string, empty, or unrecognized kind
+      (for example one a newer controller writes), a missing kind next to a
+      ``review_target``, or ``"feature"`` next to a ``review_target``.
+
+    Callers must treat ``"unknown"`` as unsupported and refuse (or ignore) the
+    run. ``controller.is_imported_run`` stays deliberately broader so that any
+    imported-review marker keeps the read-only guards in force.
+    """
+    if not isinstance(state, dict):
+        return WORKFLOW_KIND_UNKNOWN
+    has_review_target = "review_target" in state
+    if "workflow_kind" not in state:
+        return WORKFLOW_KIND_UNKNOWN if has_review_target else WORKFLOW_KIND_FEATURE
+    kind = state["workflow_kind"]
+    if kind == WORKFLOW_KIND_EXISTING_PR_REVIEW:
+        return WORKFLOW_KIND_EXISTING_PR_REVIEW
+    if kind == WORKFLOW_KIND_FEATURE and not has_review_target:
+        return WORKFLOW_KIND_FEATURE
+    return WORKFLOW_KIND_UNKNOWN
+
+
+def feature_worktree_mode(state: dict) -> str | None:
+    """Return the recorded ``repository.worktree_mode`` of a feature run.
+
+    Feature runs created before worktree modes existed record no mode and ran
+    only in the isolated flow, so a missing mode reads as ``"isolated"``. A
+    present but unrecognized or non-string mode (or a non-object repository
+    block) returns ``None`` so callers fail closed. The mode is a descriptive
+    location, not an authorization: callers select the feature workflow's own
+    guards from it only after `run_workflow_kind` has confirmed a feature run.
+    """
+    repo_block = state.get("repository", {})
+    if not isinstance(repo_block, dict):
+        return None
+    if "worktree_mode" not in repo_block:
+        return "isolated"
+    mode = repo_block["worktree_mode"]
+    return mode if mode in WORKTREE_MODES else None
+
+
+def _recorded_absolute_path(value: object) -> str | None:
+    if isinstance(value, str) and value and os.path.isabs(value):
+        return value
+    return None
+
+
+def feature_origin_worktree(state: dict) -> str | None:
+    """Return the worktree path a feature run is pinned to, or ``None``.
+
+    ``init`` pins the resolved worktree (``str(RepoInfo.worktree_path)``) in
+    ``baseline.worktree_path``, and ``accept-drift`` preserves it. Runs created
+    before that pin record the same resolved value only in
+    ``repository.worktree_path``, which ``init`` has always written and only a
+    pre-pin ``accept-drift`` rewrote (always together with
+    ``baseline.worktree_path``), so it is used when ``baseline.worktree_path`` is
+    absent. A present but malformed pin, or no recorded path at all, returns
+    ``None``: the run's worktree identity is unknown and callers must refuse
+    rather than guess. Compare the result with ``str(repo.worktree_path)``; the
+    repository id is shared by linked worktrees and does not identify one.
+    """
+    baseline = state.get("baseline", {})
+    if not isinstance(baseline, dict):
+        return None
+    if "worktree_path" in baseline:
+        return _recorded_absolute_path(baseline["worktree_path"])
+    repo_block = state.get("repository", {})
+    if isinstance(repo_block, dict):
+        return _recorded_absolute_path(repo_block.get("worktree_path"))
+    return None
+
+
+def recorded_allow_main(state: dict) -> bool | None:
+    """Return the feature run's persisted ``--allow-main`` authorization.
+
+    ``init`` records ``feature_authorization.allow_main`` as a boolean on every
+    feature run. ``None`` means the authorization is unknown (the run predates
+    the field, or the field is malformed) and must be treated as not granted;
+    it is never inferred from the branch, the command line, or a skill name.
+    The field is meaningful only for feature runs, and only current-checkout
+    feature runs consult it.
+    """
+    block = state.get("feature_authorization")
+    if not isinstance(block, dict):
+        return None
+    value = block.get("allow_main")
+    return value if isinstance(value, bool) else None
+
+
+# ---------------------------------------------------------------------------
 # Drift detection
 # ---------------------------------------------------------------------------
 
@@ -1640,6 +1754,11 @@ def detect_drift(state: dict, repo: RepoInfo) -> DriftResult:
 
     if isinstance(baseline, dict):
         recorded_worktree = baseline.get("worktree_path", "")
+        if "worktree_path" not in baseline and run_workflow_kind(state) == WORKFLOW_KIND_FEATURE:
+            # A feature run created before the pin records its origin only in
+            # `repository.worktree_path`; compare against the same origin that
+            # reuse, accept-drift, and the Stop hook use.
+            recorded_worktree = feature_origin_worktree(state) or ""
         if recorded_worktree and str(repo.worktree_path) != recorded_worktree:
             return DriftResult(
                 kind=DriftKind.UNSAFE,
@@ -1648,8 +1767,9 @@ def detect_drift(state: dict, repo: RepoInfo) -> DriftResult:
                     f"current {str(repo.worktree_path)!r}."
                 ),
                 recovery=(
-                    "Switch to the recorded worktree or run `accept-drift` "
-                    "to record the new worktree as the baseline."
+                    "Run the command from the recorded worktree; a run stays "
+                    "pinned to its originating worktree and `accept-drift` does "
+                    "not re-bind it to another one."
                 ),
             )
 

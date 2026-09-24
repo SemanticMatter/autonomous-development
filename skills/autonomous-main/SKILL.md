@@ -77,6 +77,10 @@ the current `main`/`master` checkout.
    `--run-id <run-id>` to all subsequent commands. If `doctor` reports a missing prerequisite,
    mark the run blocked and report it rather than bypassing it.
 
+   The controller persists the `--allow-main` authorization in this run and pins the run to this
+   checkout. `accept-drift` re-checks that persisted authorization; it cannot grant it to a run
+   that was initialized without it.
+
 3. Repeatedly ask the controller for the next phase, then execute it:
 
    ```bash
