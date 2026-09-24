@@ -1754,6 +1754,11 @@ def detect_drift(state: dict, repo: RepoInfo) -> DriftResult:
 
     if isinstance(baseline, dict):
         recorded_worktree = baseline.get("worktree_path", "")
+        if "worktree_path" not in baseline and run_workflow_kind(state) == WORKFLOW_KIND_FEATURE:
+            # A feature run created before the pin records its origin only in
+            # `repository.worktree_path`; compare against the same origin that
+            # reuse, accept-drift, and the Stop hook use.
+            recorded_worktree = feature_origin_worktree(state) or ""
         if recorded_worktree and str(repo.worktree_path) != recorded_worktree:
             return DriftResult(
                 kind=DriftKind.UNSAFE,

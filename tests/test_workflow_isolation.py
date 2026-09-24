@@ -293,6 +293,22 @@ class CheckoutGuardTests(_RepoFixture):
                 else:
                     (repo / "README.md").unlink()
                 self.refused(repo, "requires a clean working tree")
+                self.refused(repo, "Commit or stash these changes, then retry.")
+
+    def test_repository_config_cannot_hide_dirty_entries(self) -> None:
+        repo = self.make_repo()
+        self.git(repo, "config", "status.showUntrackedFiles", "no")
+        (repo / "untracked.txt").write_text("x\n", encoding="utf-8")
+        self.refused(repo, "untracked.txt")
+
+        sub = self.make_repo(feature=None)
+        repo2 = self.make_repo()
+        self.git(repo2, "-c", "protocol.file.allow=always", "submodule", "add", "-q", str(sub), "sub")
+        self.git(repo2, "commit", "-qm", "add submodule")
+        self.assertEqual(self.guard(repo2).branch, "feature")
+        (repo2 / "sub" / "README.md").write_text("changed\n", encoding="utf-8")
+        self.git(repo2, "config", "diff.ignoreSubmodules", "all")
+        self.refused(repo2, "requires a clean working tree")
 
     def test_ignored_files_do_not_make_the_checkout_unclean(self) -> None:
         repo = self.make_repo()
@@ -493,6 +509,57 @@ class ReuseTests(_RepoFixture):
         self.assert_refused(
             self.reuse(other, state_home, "--worktree-mode", "current"),
             state_home, repo, {current: current.read_bytes()}, "it is pinned to worktree",
+        )
+
+    def test_isolated_reuse_from_another_worktree_is_refused(self) -> None:
+        repo = self.make_repo()
+        linked = self.add_worktree(repo, "worktree-x")
+        state_home = self.tmpdir()
+        isolated = self.init(linked, state_home)
+        other = self.add_worktree(repo, "worktree-y")
+        for cwd in (other, repo):
+            with self.subTest(cwd=cwd.name):
+                self.assert_refused(
+                    self.reuse(cwd, state_home), state_home, repo,
+                    {isolated: isolated.read_bytes()}, "it is pinned to worktree",
+                )
+        self.assert_reused(self.reuse(linked, state_home), isolated)
+
+    def test_explicit_run_id_selects_exactly_that_run(self) -> None:
+        repo = self.make_repo()
+        state_home = self.tmpdir()
+
+        def create(run_id: str, *extra: str) -> Path:
+            result = self.ctl(repo, state_home, "--run-id", run_id, "init", "--feature", "F", *extra)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            return Path(result.stdout.strip().splitlines()[-1])
+
+        def reuse_id(run_id: str, *extra: str) -> subprocess.CompletedProcess[str]:
+            return self.ctl(repo, state_home, "--run-id", run_id, "init", "--feature", "Z",
+                            "--reuse", *extra)
+
+        isolated = create("run-a")
+        first = create("run-b", "--worktree-mode", "current", "--force")
+        second = create("run-c", "--worktree-mode", "current", "--force")
+        ambiguous = self.reuse(repo, state_home, "--worktree-mode", "current")
+        self.assertNotEqual(ambiguous.returncode, 0)
+        self.assertIn("Use --run-id to select one explicitly", ambiguous.stderr)
+        self.assert_reused(reuse_id("run-c", "--worktree-mode", "current"), second)
+        self.assert_reused(reuse_id("run-b", "--worktree-mode", "current"), first)
+
+        before = {p: p.read_bytes() for p in (isolated, first, second)}
+        self.assert_refused(
+            reuse_id("run-a", "--worktree-mode", "current"), state_home, repo, before,
+            "run-a: it runs in isolated worktree mode",
+        )
+        self.assert_refused(
+            reuse_id("run-missing", "--worktree-mode", "current"), state_home, repo, before,
+            "run-missing: no active run has this ID",
+        )
+        self.assertEqual(self.ctl(repo, state_home, "--run-id", "run-a", "cancel").returncode, 0)
+        before[isolated] = isolated.read_bytes()
+        self.assert_refused(
+            reuse_id("run-a"), state_home, repo, before, "run-a: no active run has this ID"
         )
 
     def test_imported_unknown_and_malformed_runs_are_refused(self) -> None:
@@ -704,6 +771,7 @@ class AcceptDriftTests(_RepoFixture):
         blocked = self.ctl(other, state_home, "run-check", "--name", "t", "--", "true")
         self.assertNotEqual(blocked.returncode, 0)
         self.assertIn("Worktree changed", blocked.stderr)
+        self.assertNotIn("record the new baseline", blocked.stderr)
         self.assert_refused(
             self.accept(other, state_home), path, path.read_bytes(),
             "never re-binds a run to another worktree",
@@ -717,6 +785,24 @@ class AcceptDriftTests(_RepoFixture):
             self.accept(repo2, home2), isolated, isolated.read_bytes(),
             "never re-binds a run to another worktree",
         )
+
+    def test_pre_pin_run_mutations_compare_the_recorded_origin(self) -> None:
+        repo = self.make_repo()
+        first = self.add_worktree(repo, "worktree-x")
+        state_home = self.tmpdir()
+        path = self.init(first, state_home, "--worktree-mode", "current")
+        self.make_pre_pin(path)
+        check = ("run-check", "--name", "t", "--", sys.executable, "-c", "0")
+        self.assertEqual(self.ctl(first, state_home, *check).returncode, 0)
+        self.git(repo, "worktree", "remove", "--force", str(first))
+        moved = self.tmpdir() / "moved"
+        self.git(repo, "worktree", "add", "-q", str(moved), "worktree-x")
+        before = path.read_bytes()
+        blocked = self.ctl(moved, state_home, *check)
+        self.assertNotEqual(blocked.returncode, 0)
+        self.assertIn("Worktree changed", blocked.stderr)
+        self.assertNotIn("record the new baseline", blocked.stderr)
+        self.assertEqual(path.read_bytes(), before)
 
     def test_unclean_detached_or_failing_checkout_is_refused(self) -> None:
         repo, state_home, path = self.current_run()

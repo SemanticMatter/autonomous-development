@@ -30,7 +30,7 @@ The plugin deliberately keeps Claude as the implementation orchestrator and uses
 | `/autonomous-development:autonomous-main` | Current checkout | `main` / `master` (explicit opt-in via `--allow-main`) | You explicitly want direct edits on `main`/`master`. Still requires a clean tree. |
 | `/autonomous-development:review-existing-pr` | Current checkout, **read-only** | The PR/branch you already have checked out | Review a PR the plugin did not implement. No enhance/plan/implement, no edits, no commits. |
 
-Both current-checkout **implementation** workflows (`autonomous-current` and `autonomous-main`) are opt-in. They do not create `.claude/worktrees/*`, do not enter a worktree, and never commit — the user reviews with normal `git diff` and commits manually. They require a clean working tree (`git status --porcelain` must be empty): modified, staged, deleted, and untracked files all make it unclean. They also require an attached named branch; detached HEAD is unsupported. `--allow-main` is valid only with `--worktree-mode current`; `autonomous-current` refuses `main`/`master`, while `autonomous-main` passes `--allow-main` to bypass that guard. `review-existing-pr` also runs in the current checkout and likewise requires a clean tree, but it is strictly read-only: it never edits, commits, or enters a worktree, and it works on `main`/`master` or a detached HEAD without `--allow-main` because it only reads the diff.
+Both current-checkout **implementation** workflows (`autonomous-current` and `autonomous-main`) are opt-in. They do not create `.claude/worktrees/*`, do not enter a worktree, and never commit — the user reviews with normal `git diff` and commits manually. They require a clean working tree (`git status --porcelain` must be empty, whatever repository config such as `status.showUntrackedFiles` says): modified, staged, deleted, and untracked files and modified submodules all make it unclean. They also require an attached named branch; detached HEAD is unsupported. `--allow-main` is valid only with `--worktree-mode current`; `autonomous-current` refuses `main`/`master`, while `autonomous-main` passes `--allow-main` to bypass that guard. `review-existing-pr` also runs in the current checkout and likewise requires a clean tree, but it is strictly read-only: it never edits, commits, or enters a worktree, and it works on `main`/`master` or a detached HEAD without `--allow-main` because it only reads the diff.
 
 ## Repository
 
@@ -636,7 +636,10 @@ untracked files. A Git error while inspecting the checkout is a refusal, never a
   identifies the one checkout a run belongs to. Mutating commands from another worktree are UNSAFE
   drift, and `accept-drift` does not re-bind the run.
 - **`worktree_mode` is descriptive.** `repository.worktree_mode` records where a run operates.
-  It is not an authorization: each workflow's own guards decide what is permitted.
+  It is not an authorization: each workflow's own guards decide what is permitted. The feature
+  workflow uses it to choose which guards apply: only runs recorded as current-checkout get the
+  clean-checkout guard and the `main`/`master` refusal. `isolated` is not verified to be a linked
+  worktree, so an isolated run started in the primary checkout is not subject to that refusal.
 - **`--allow-main` is a feature-only, persisted authorization.** `init` records it as
   `feature_authorization.allow_main` (always `false` for isolated runs). It is never inferred from
   the branch, the command line, or the skill, and no other workflow uses it.
@@ -644,9 +647,10 @@ untracked files. A Git error while inspecting the checkout is a refusal, never a
   reviews record `existing_pr_review`. Runs that record no kind are treated as feature runs only
   when nothing marks them as imported. Any other kind is unknown and refused by the paths below.
 - **`init --reuse`** adopts only an active feature run of this repository whose recorded
-  worktree mode matches the request; a current-checkout run must also be pinned to the invoking
-  worktree. It never adopts an imported review, an unknown kind, or a run of the other mode, and
-  it never changes a run to make it compatible. Repeat the request with the run's own
+  worktree mode matches the request and that is pinned to the invoking worktree, in either mode.
+  It never adopts an imported review, an unknown kind, a run of the other mode, or a run pinned to
+  another worktree, and it never changes a run to make it compatible. With `--run-id` it considers
+  only that run and never falls back to another one. Repeat the request with the run's own
   `--worktree-mode` from its own worktree, or pass `--force` to start an additional run.
 - **The Stop hook** attached to the feature skills acts only on the single active feature run
   pinned to the session's worktree. It ignores imported reviews, unknown kinds, runs pinned to
@@ -658,9 +662,8 @@ untracked files. A Git error while inspecting the checkout is a refusal, never a
 - **Older runs.** A run created before these fields existed stays readable. Its originating
   worktree is taken from `repository.worktree_path`, which `init` has always recorded; a missing
   worktree mode reads as isolated; a missing `--allow-main` authorization reads as not granted.
-  Mutating commands compare the worktree only for runs that record the pin (every run `init`
-  creates now, and any run after `accept-drift`). A recovery that needs an identity or
-  authorization the run does not record fails closed.
+  Mutating commands compare the worktree against that same recorded origin. A recovery that
+  needs an identity or authorization the run does not record fails closed.
 - **Future workflows** must define their own branch and drift policies. The shared
   attached-clean-checkout guard contains no branch policy and no bypass, and neither `--allow-main`
   nor `accept-drift` extends to another workflow kind.

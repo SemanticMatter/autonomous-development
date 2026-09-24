@@ -336,8 +336,7 @@ def require_no_unsafe_drift(state: dict, repo: RepoInfo) -> None:
     if drift.kind == DriftKind.UNSAFE:
         raise WorkflowError(
             f"Unsafe repository drift detected: {drift.message}\n"
-            f"Recovery: {drift.recovery}\n"
-            f"Use `accept-drift` to record the new baseline when safe."
+            f"Recovery: {drift.recovery}"
         )
 
 
@@ -2089,8 +2088,11 @@ def require_attached_clean_checkout(repo: RepoInfo, *, context: str) -> Checkout
     * `rev-parse --verify HEAD` resolves to `repo.head_commit`;
     * `branch --show-current` names a branch (an empty result is a detached
       HEAD) that equals `repo.branch`;
-    * `status --porcelain` reports no entries, so modified, staged, deleted, and
-      untracked files all make the checkout unclean (ignored files do not).
+    * `status --porcelain --untracked-files=normal --ignore-submodules=none`
+      reports no entries, so modified, staged, deleted, and untracked files and
+      modified submodules all make the checkout unclean (ignored files do not).
+      The flags override repository config such as `status.showUntrackedFiles`
+      and `diff.ignoreSubmodules` that would otherwise hide entries.
 
     A git failure, missing or malformed output, or a checkout that changed since
     `repo` was resolved is a refusal and is never read as a clean or attached
@@ -2103,7 +2105,10 @@ def require_attached_clean_checkout(repo: RepoInfo, *, context: str) -> Checkout
         toplevel = _git_ro(root, "rev-parse", "--show-toplevel", check=True)
         head = _git_ro(root, "rev-parse", "--verify", "HEAD", check=True)
         branch = _git_ro(root, "branch", "--show-current", check=True)
-        status = _git_ro(root, "status", "--porcelain", check=True)
+        status = _git_ro(
+            root, "status", "--porcelain", "--untracked-files=normal",
+            "--ignore-submodules=none", check=True,
+        )
     except (WorkflowError, StateError) as exc:
         raise WorkflowError(
             f"{context} could not inspect the checkout: {exc}. A failed Git "
@@ -2137,7 +2142,8 @@ def require_attached_clean_checkout(repo: RepoInfo, *, context: str) -> Checkout
         raise WorkflowError(
             f"{context} requires a clean working tree. Modified, staged, deleted, "
             "and untracked files all make the working tree unclean. "
-            f"Dirty entries: {preview}{suffix}"
+            f"Dirty entries: {preview}{suffix}. Commit or stash these changes, "
+            "then retry."
         )
     return CheckoutIdentity(worktree_path=repo.worktree_path, branch=branch, head_commit=head)
 
@@ -5169,9 +5175,10 @@ def feature_reuse_incompatibility(
     """Return why `init --reuse` must not adopt `state`, or None if it may.
 
     A run is compatible only when it is an active feature run of this
-    repository whose recorded worktree mode equals the requested one; a
-    current-checkout run must also be pinned to the invoking worktree. Nothing
-    is mutated, so an incompatible run is never made compatible.
+    repository whose recorded worktree mode equals the requested one and that
+    is pinned to the invoking worktree, in either mode: a run pinned elsewhere
+    would fail every later mutating command with worktree drift. Nothing is
+    mutated, so an incompatible run is never made compatible.
     """
     if run_workflow_kind(state) != WORKFLOW_KIND_FEATURE:
         return _unsupported_kind_reason(state)
@@ -5188,12 +5195,11 @@ def feature_reuse_incompatibility(
             f"it runs in {worktree_mode_label(recorded_mode)} mode, not "
             f"{worktree_mode_label(worktree_mode)} mode"
         )
-    if worktree_mode == "current":
-        origin = feature_origin_worktree(state)
-        if origin is None:
-            return "it records no valid originating worktree"
-        if origin != str(repo.worktree_path):
-            return f"it is pinned to worktree {origin!r}"
+    origin = feature_origin_worktree(state)
+    if origin is None:
+        return "it records no valid originating worktree"
+    if origin != str(repo.worktree_path):
+        return f"it is pinned to worktree {origin!r}"
     return None
 
 
@@ -5231,7 +5237,13 @@ def cmd_init(args: argparse.Namespace) -> int:
             if args.reuse:
                 compatible = []
                 refused: list[str] = []
-                for candidate in active_runs:
+                candidates = active_runs
+                if run_id_override:
+                    # An explicit --run-id selects exactly that run; never another one.
+                    candidates = [r for r in active_runs if r.run_id == run_id_override]
+                    if not candidates:
+                        refused.append(f"{run_id_override}: no active run has this ID")
+                for candidate in candidates:
                     reason = feature_reuse_incompatibility(
                         candidate.state, worktree_mode=worktree_mode, repo=repo
                     )
@@ -8534,15 +8546,10 @@ def cmd_accept_drift(args: argparse.Namespace) -> int:
     print("Drift accepted. Updated baseline:")
     old_commit = old_baseline.get("commit", "(unknown)")
     old_branch = old_baseline.get("branch", "(unknown)")
-    old_worktree = old_baseline.get(
-        "worktree_path", old_repo_block.get("worktree_path", "")
-    )
     if old_commit != repo.head_commit:
         print(f"  commit: {old_commit} -> {repo.head_commit}")
     if old_branch != repo.branch:
         print(f"  branch: {old_branch} -> {repo.branch}")
-    if old_worktree and old_worktree != str(repo.worktree_path):
-        print(f"  worktree: {old_worktree} -> {repo.worktree_path}")
     if old_repo_block.get("id") and old_repo_block["id"] != repo.id:
         print(f'  repo_id: {old_repo_block["id"]} -> {repo.id}')
     return 0

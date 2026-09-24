@@ -15,9 +15,12 @@ Fixed:
   runs pinned to other worktrees or recorded for another repository, and terminal
   runs are left byte-identical.
 - **`init --reuse` adopted any sole active run**, including an imported review, a
-  run of the other worktree mode, or a current-checkout run from another
-  worktree. It now adopts only a compatible active feature run and otherwise
-  refuses with the reasons (or, with `--force`, starts a new run as before).
+  run of the other worktree mode, or a run from another worktree. It now adopts
+  only an active feature run of the requested mode pinned to the invoking
+  worktree and otherwise refuses with the reasons (or, with `--force`, starts a
+  new run as before). It also ignored `--run-id`, although its ambiguity error
+  recommended it: `--run-id` now selects exactly that run, with no fallback to
+  another one.
 - **`accept-drift` bypassed the current-checkout guards.** It refused only
   imported runs, so it accepted unknown kinds and could re-baseline a
   current-checkout run onto `main`/`master`, a detached HEAD, a dirty tree, or
@@ -25,11 +28,17 @@ Fixed:
   worktree, and for current-checkout runs re-runs the attached-clean-checkout
   guard and the `main`/`master` refusal with the persisted authorization.
 - **The current-checkout dirty check failed open.** A failing `git status` read
-  as a clean tree. The new `require_attached_clean_checkout` guard fails closed
-  on every Git error and on unexpected output, and holds no branch policy.
+  as a clean tree, and repository config such as `status.showUntrackedFiles=no`
+  or `diff.ignoreSubmodules` could hide dirty entries. The new
+  `require_attached_clean_checkout` guard fails closed on every Git error and on
+  unexpected output, pins the `git status` flags, and holds no branch policy.
 - **Feature runs did not pin their worktree.** `init` now records
   `baseline.worktree_path`, so mutating commands from another worktree are
-  UNSAFE drift.
+  UNSAFE drift. Runs created before the pin are compared against their recorded
+  `repository.worktree_path`.
+- **UNSAFE drift errors ended with "Use `accept-drift` to record the new
+  baseline when safe."** even where `accept-drift` refuses. Each drift kind now
+  gives only its own recovery.
 
 Added:
 - `run_workflow_kind()`, the authoritative workflow-kind classifier (`feature`,
@@ -45,9 +54,12 @@ Compatibility:
   mode reads as isolated, the originating worktree falls back to
   `repository.worktree_path`, and a missing `--allow-main` authorization reads as
   not granted. Recoveries that need an unrecorded identity fail closed. The
-  state schema version is unchanged.
+  state schema version is unchanged, so a controller older than this change
+  still loads new feature runs and ignores the pin and the persisted
+  authorization: downgrading the plugin drops these guards.
 - `worktree_mode` stays a descriptive location. The feature branch policy is
-  still the literal `main`/`master` set.
+  still the literal `main`/`master` set, and it applies only to runs recorded as
+  current-checkout.
 
 ### Review round 12 — fixes from the twelfth review (both tracks, PR #4)
 
