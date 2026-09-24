@@ -85,6 +85,19 @@ def _minimal_state(run_id: str = "test-run", status: str = "active") -> dict:
     }
 
 
+def _pinned_feature_state(repo_info, run_id: str) -> dict:
+    """A minimal active feature run bound to `repo_info`'s repository and worktree,
+    as `init` records it."""
+    state = _minimal_state(run_id=run_id, status="active")
+    state["workflow_kind"] = "feature"
+    state["repository"] = {
+        "id": repo_info.id,
+        "worktree_path": str(repo_info.worktree_path),
+    }
+    state["baseline"]["worktree_path"] = str(repo_info.worktree_path)
+    return state
+
+
 # ---------------------------------------------------------------------------
 # Test class
 # ---------------------------------------------------------------------------
@@ -853,7 +866,7 @@ class StateModuleTests(unittest.TestCase):
         run_id = new_run_id()
         run_dir = run_dir_path(state_home, repo_info.id, run_id)
         run_dir.mkdir(parents=True, exist_ok=True)
-        save_run_state(run_dir, _minimal_state(run_id=run_id, status="active"))
+        save_run_state(run_dir, _pinned_feature_state(repo_info, run_id))
 
         payload = json.dumps({"cwd": str(subdir), "hook_event_name": "Stop"})
         env = {**os.environ, "CLAUDE_AUTONOMOUS_STATE_HOME": str(state_home)}
@@ -885,7 +898,7 @@ class StateModuleTests(unittest.TestCase):
             run_id = f"run-{i:08d}-000000"
             run_dir = run_dir_path(state_home, repo_info.id, run_id)
             run_dir.mkdir(parents=True, exist_ok=True)
-            save_run_state(run_dir, _minimal_state(run_id=run_id, status="active"))
+            save_run_state(run_dir, _pinned_feature_state(repo_info, run_id))
 
         payload = json.dumps({"cwd": str(repo), "hook_event_name": "Stop"})
         env = {**os.environ, "CLAUDE_AUTONOMOUS_STATE_HOME": str(state_home)}
@@ -902,6 +915,7 @@ class StateModuleTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0)
         # Should NOT block when ambiguous
         self.assertNotIn('"decision": "block"', result.stdout)
+        self.assertIn("multiple active feature runs", result.stderr)
 
     # -----------------------------------------------------------------------
     # 24. read-only plugin installation

@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
-"""Skill-scoped Stop hook that keeps a bounded autonomous run moving."""
+"""Skill-scoped Stop hook that keeps a bounded autonomous feature run moving.
+
+The hook is attached only by the feature-workflow skills. It acts on at most one
+run: the single active feature run pinned to the worktree the hook runs in. It
+never selects, blocks, or mutates an existing-PR review run, a run of an unknown
+workflow kind, a run pinned to another worktree, a run of another repository, or
+a terminal run; with no applicable run, or several, it exits without blocking.
+"""
 
 from __future__ import annotations
 
@@ -10,14 +17,17 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from state import (
-    TERMINAL_STATUSES,
+    WORKFLOW_KIND_FEATURE,
+    RepoInfo,
     RunStateLock,
     StateError,
+    feature_origin_worktree,
     find_active_runs,
     load_run_state,
     require_active_run_state,
     resolve_repository,
     resolve_state_home,
+    run_workflow_kind,
     save_run_state,
     detect_legacy_state,
     LEGACY_STATE_FILE_NAME,
@@ -70,12 +80,37 @@ def reason_for(state: dict, run_dir: Path) -> str:
     return "Run the controller completion-gate evaluation and provide the final implementation report."
 
 
-def _block_and_exit(run_dir: Path) -> int:
-    """Atomically increment stop_gate_blocks and persist; print block JSON or exhaust. Return 0."""
+def is_applicable_feature_run(state: dict, repo: RepoInfo) -> bool:
+    """Whether the hook may act on `state` from the worktree of `repo`.
+
+    Only an active feature run (per `run_workflow_kind`) that records this
+    repository's id and is pinned to this exact worktree applies.
+    """
+    repo_block = state.get("repository")
+    return (
+        run_workflow_kind(state) == WORKFLOW_KIND_FEATURE
+        and state.get("status") == "active"
+        and isinstance(repo_block, dict)
+        and repo_block.get("id") == repo.id
+        and feature_origin_worktree(state) == str(repo.worktree_path)
+    )
+
+
+def _block_and_exit(run_dir: Path, repo: RepoInfo | None) -> int:
+    """Atomically increment stop_gate_blocks and persist; print block JSON or exhaust. Return 0.
+
+    `repo` re-checks applicability under the lock; it is None only for the
+    legacy in-repository layout, whose location already binds it to this
+    worktree.
+    """
     with RunStateLock(run_dir):
         try:
             state = load_run_state(run_dir, required=True)
         except Exception:
+            return 0
+        if run_workflow_kind(state) != WORKFLOW_KIND_FEATURE:
+            return 0
+        if repo is not None and not is_applicable_feature_run(state, repo):
             return 0
         # Require exactly "active" before mutating anything. An unknown, missing,
         # or non-string status (corruption, a partial write, or a status a future
@@ -130,9 +165,6 @@ def main() -> int:
     except Exception:
         return 0
 
-    run_dir: Path
-    state: dict
-
     if len(active) == 0:
         # Fall back to legacy state in repo root
         legacy_dir = detect_legacy_state(repo.canonical_root)
@@ -143,30 +175,27 @@ def main() -> int:
             state = json.loads(legacy_path.read_text(encoding="utf-8"))
         except Exception:
             return 0
-        if not isinstance(state, dict):
+        if not isinstance(state, dict) or state.get("status") != "active":
             return 0
-        run_dir = legacy_dir
+        if run_workflow_kind(state) != WORKFLOW_KIND_FEATURE:
+            return 0
+        return _block_and_exit(legacy_dir, None)
 
-    elif len(active) == 1:
-        run_dir = active[0].run_dir
-        state = active[0].state
-
-    else:
-        # Multiple active runs — ambiguous; fail safe without blocking
-        ids = ", ".join(r.run_id for r in active)
+    # Step 4: act only on the active feature run pinned to this worktree
+    applicable = [r for r in active if is_applicable_feature_run(r.state, repo)]
+    if not applicable:
+        return 0
+    if len(applicable) > 1:
+        ids = ", ".join(r.run_id for r in applicable)
         print(
-            f"autonomous-development stop-gate: multiple active runs ({ids}); "
-            "cannot auto-select — resolve manually.",
+            f"autonomous-development stop-gate: multiple active feature runs in "
+            f"this worktree ({ids}); cannot auto-select — resolve manually.",
             file=sys.stderr,
         )
         return 0
 
-    # Step 4: skip if run is already terminal
-    if state.get("status") in TERMINAL_STATUSES:
-        return 0
-
     # Step 5: enforce bounded block counter
-    return _block_and_exit(run_dir)
+    return _block_and_exit(applicable[0].run_dir, repo)
 
 
 if __name__ == "__main__":
