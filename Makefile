@@ -1,10 +1,13 @@
-.PHONY: check test doctor clean
+.PHONY: check test precommit doctor clean
 
 check: test
 	python3 scripts/validate_project.py
 
 test:
-	python3 -m unittest discover -s tests -v
+	python3 tests/run_isolated.py discover -s tests -v
+
+precommit:
+	pre-commit run --all-files
 
 doctor:
 	python3 scripts/controller.py doctor

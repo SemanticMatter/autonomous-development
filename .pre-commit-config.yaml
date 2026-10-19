@@ -1,0 +1,51 @@
+# Development checks for autonomous-development.
+#
+#   pre-commit run --all-files                     # fast checks
+#   pre-commit run --all-files --hook-stage manual # also the full offline test suite
+#
+# The local hooks use `language: system`: run them from an environment that has the
+# runtime dependency installed (`pip install -r requirements.txt pre-commit`).
+# The test suite runs through tests/run_isolated.py (stub `codex` first on PATH, scratch
+# HOME/XDG/CODEX_HOME, no provider credentials), never as a plain `unittest discover`.
+# That is environment isolation, not a sandbox (see the runner's docstring).
+# Linters/formatters (ruff, black, mypy, bandit) are intentionally not enabled yet:
+# the existing code has never been run through them, and enabling them belongs in a
+# dedicated change rather than as churn or blanket ignores here.
+
+repos:
+  # pre-commit-hooks supplies a multitude of small hooks
+  # To get an overview of them all as well as the ones used here, please see
+  # https://github.com/pre-commit/pre-commit-hooks#hooks-available
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: check-json
+        name: Check JSON
+      - id: check-toml
+        name: Check TOML
+      - id: check-yaml
+        name: Check YAML
+      - id: debug-statements
+      - id: end-of-file-fixer
+      - id: mixed-line-ending
+      - id: trailing-whitespace
+        args: ["--markdown-linebreak-ext=md"]
+
+  - repo: local
+    hooks:
+      # Plugin layout, manifest/version consistency and schema strictness.
+      - id: validate-project
+        name: validate project
+        entry: python scripts/validate_project.py
+        language: system
+        pass_filenames: false
+        always_run: true
+
+      # Full offline test suite (heavy: ~2 minutes); run on demand or before push.
+      - id: unittest
+        name: unittest (full suite, isolated)
+        entry: python tests/run_isolated.py
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [manual, pre-push]

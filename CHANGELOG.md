@@ -41,6 +41,18 @@ Known limitations:
 - Durability against power loss depends on the storage stack honoring `fsync`, which is
   unverified on WSL2.
 
+### Development checks
+
+- `tests/run_isolated.py` runs the offline test suite with a stub `codex` first on `PATH`
+  (directories holding another `codex` are dropped), scratch `HOME`/XDG/`CODEX_HOME` and no
+  provider credentials. Under a plain `unittest discover` from a normal shell, the `doctor`
+  tests could run a real `codex` found on `PATH`. `make test` now uses it. It is environment
+  isolation, not a sandbox: tests keep normal file-system and network access.
+- `.pre-commit-config.yaml`: non-modifying JSON/TOML/YAML and debug-statement checks, the
+  end-of-file, line-ending and trailing-whitespace fixers, `validate_project.py`, and the
+  isolated test suite on the `manual`/`pre-push` stages. `make precommit` runs it, and the
+  `dev` extra declares `pre-commit`.
+
 ### Review round 12 — fixes from the twelfth review (both tracks, PR #4)
 
 Both tracks verified every round-10 and round-11 fix, including against probes

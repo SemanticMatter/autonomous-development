@@ -159,6 +159,21 @@ make check
 claude plugin validate . --strict
 ```
 
+`make check` runs the offline test suite through `tests/run_isolated.py`. Use it rather than a
+plain `python -m unittest`: some tests start `controller.py` as a subprocess that looks `codex` up
+on `PATH`. The runner puts a stub `codex` first on `PATH` (dropping directories that hold another
+`codex`), passes an allowlisted environment without provider credentials, and points `HOME`, the
+XDG directories and `CODEX_HOME` at a temporary directory. It is not a sandbox: the tests keep
+normal file-system and network access, and the isolation holds only for code that finds Codex
+and its configuration through `PATH` and those variables. Use an interpreter with
+`requirements.txt` installed. The same checks run
+through [pre-commit](https://pre-commit.com/) (`pip install -r requirements.txt 'pre-commit~=4.6'`):
+
+```bash
+pre-commit run --all-files                      # JSON/TOML/YAML, debug statements, layout
+pre-commit run --all-files --hook-stage manual  # also the isolated offline test suite
+```
+
 ## Adaptive workflow modes
 
 `init` accepts `--mode` to scale workflow depth to the change:
