@@ -6749,6 +6749,7 @@ def cmd_codex(args: argparse.Namespace) -> int:
     tracker = _reserve_codex_attempt(
         args,
         repo=repo,
+        state_home=state_home,
         run_ref=run_ref,
         state=state,
         phase=phase,
@@ -6819,6 +6820,7 @@ def _reserve_codex_attempt(
     args: argparse.Namespace,
     *,
     repo: RepoInfo,
+    state_home: Path,
     run_ref: Any,
     state: Mapping[str, Any],
     phase: str,
@@ -6830,7 +6832,8 @@ def _reserve_codex_attempt(
     """Durably reserve one Codex attempt in the accounting ledger before launch.
 
     Raises WorkflowError -- and Codex is NOT launched -- when the ledger cannot be
-    resolved, would live inside the target worktree, or cannot be written durably.
+    resolved, would live inside the target worktree or the (disposable) run-state
+    home, or cannot be written durably.
     """
     slot = phase if phase in {"enhance", "plan"} else output_name.removesuffix(".codex.json")
     timeout = getattr(args, "timeout", None)
@@ -6879,6 +6882,7 @@ def _reserve_codex_attempt(
         reservation["engine"] = accounting.engine_provenance(PLUGIN_ROOT)
         home = accounting.resolve_accounting_home()
         accounting.require_outside(home, repo.canonical_root)
+        accounting.require_outside(home, state_home, what="run-state home")
         ledger = accounting.Ledger(home)
         reserved = ledger.reserve(reservation)
     except (StateError, OSError) as exc:
@@ -6890,8 +6894,8 @@ def _reserve_codex_attempt(
     if reserved.predecessor_unsettled:
         print(
             f"[accounting] warning: earlier attempt {reserved.retry_of} for {slot} is "
-            "still unsettled (running, crashed or interrupted); launching "
-            f"{reserved.attempt_id} as its retry. Inspect it with "
+            "still unsettled (running, crashed, interrupted or refused before launch); "
+            f"launching {reserved.attempt_id} as its retry. Inspect it with "
             f"`controller.py accounting show {reserved.retry_of}`.",
             file=sys.stderr,
         )
@@ -6899,12 +6903,16 @@ def _reserve_codex_attempt(
 
 
 def _warn_unsettled(tracker: accounting.AttemptTracker, problem: str | None) -> None:
-    """Report (never raise) a settlement failure; the attempt stays visibly unsettled."""
+    """Report (never raise) a settlement failure.
+
+    The attempt normally stays unsettled; when only the final sync failed, the
+    settlement line may be present but not durable, so the message says both."""
     if problem is None:
         return
     print(
-        f"[accounting] warning: attempt {tracker.attempt_id} could not be settled "
-        f"({problem}); it remains UNSETTLED in the ledger. Inspect it with "
+        f"[accounting] warning: attempt {tracker.attempt_id} could not be durably "
+        f"settled ({problem}). The ledger may show it UNSETTLED, or settled without a "
+        "durability guarantee. Inspect it with "
         f"`controller.py accounting show {tracker.attempt_id}`.",
         file=sys.stderr,
     )
@@ -7281,6 +7289,7 @@ def _run_reserved_codex_attempt(
 
             state["stop_gate_blocks"] = 0
             save_run_state(run_dir, state)
+            tracker.published = True
         published = True
     finally:
         # On any failure before the locked publish completes, remove the

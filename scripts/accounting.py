@@ -231,8 +231,9 @@ def resolve_accounting_home(
     return base_home / ".local" / "state" / DEFAULT_DIR_NAME
 
 
-def require_outside(home: Path, root: Path) -> None:
-    """Refuse a ledger that would live inside the reviewed worktree."""
+def require_outside(home: Path, root: Path, *, what: str = "target worktree") -> None:
+    """Refuse a ledger that would live inside `root`: the reviewed worktree, or
+    disposable run state that would be deleted together with it."""
     try:
         resolved_home = home.resolve()
         resolved_root = root.resolve()
@@ -240,9 +241,9 @@ def require_outside(home: Path, root: Path) -> None:
         raise AccountingError(f"Cannot resolve accounting home {home}: {exc}") from exc
     if resolved_home == resolved_root or resolved_root in resolved_home.parents:
         raise AccountingError(
-            f"The accounting home {str(resolved_home)!r} resolves inside the target "
-            f"worktree {str(resolved_root)!r}. Set ${ACCOUNTING_HOME_ENV} to an "
-            "absolute path outside the repository."
+            f"The accounting home {str(resolved_home)!r} resolves inside the {what} "
+            f"{str(resolved_root)!r}. Set ${ACCOUNTING_HOME_ENV} to an absolute path "
+            "outside it."
         )
 
 
@@ -990,9 +991,19 @@ class Ledger:
             body = dict(reservation)
             body["retry_of"] = predecessor.attempt_id if predecessor else None
             body["slot_attempt"] = len(same_slot) + 1
-            self._append(
-                self._event("attempt.reserved", attempt_id, ledger_id, moment, reservation=body)
-            )
+            event = self._event("attempt.reserved", attempt_id, ledger_id, moment, reservation=body)
+            _validate_new_event(event)  # an invalid reservation refuses before any write
+            try:
+                self._append(event)
+            except AccountingError as exc:
+                # The line may have been written before the failure (e.g. fsync), and
+                # an append-only ledger cannot take it back.
+                raise AccountingError(
+                    f"{exc}. Attempt {attempt_id} may nevertheless be in the ledger as "
+                    "an unsettled reservation that never launched; once this controller "
+                    f"has exited, settle it with `controller.py accounting reconcile "
+                    f"{attempt_id} --as abandoned`."
+                ) from exc
         return Reservation(
             attempt_id=attempt_id,
             ledger_id=ledger_id,
@@ -1049,7 +1060,22 @@ class Ledger:
         boot_id: str | None = None,
         pid_alive: Callable[[int], bool | None] = _pid_alive,
     ) -> str:
-        """Operator-confirmed abandonment of an unsettled attempt (never relaunches)."""
+        """Operator-confirmed abandonment of an unsettled attempt (never relaunches).
+
+        Allowed only when the launching controller is gone, or when that cannot be
+        determined (no boot id or process check on this host) and the attempt is
+        stale: a controller that is still running would otherwise have its real
+        settlement refused, because the first settlement is authoritative.
+        """
+        moment = now or utc_now()
+        # Look the attempt up read-only first, so a mistyped id or a wrong
+        # accounting home does not initialize a ledger.
+        if attempt_id not in read_ledger(
+            self.home, validate=False, validate_attempts={attempt_id}
+        ).attempts:
+            raise AccountingError(
+                f"Unknown attempt {attempt_id!r} in {self.home}; nothing was written."
+            )
 
         def guard(record: AttemptRecord) -> None:
             state = owner_process_state(record.reservation, boot_id=boot_id, pid_alive=pid_alive)
@@ -1059,8 +1085,15 @@ class Ledger:
                     f"{record.reservation['launcher']['pid']} is alive on this boot); "
                     "refusing to mark it abandoned."
                 )
+            age = (moment - _parse_iso(record.reserved["recorded_at"])).total_seconds()
+            if state == "unknown" and not is_stale(record.reservation, age):
+                raise AccountingError(
+                    f"Cannot tell whether the controller that launched attempt {attempt_id} "
+                    "is still running, and the attempt is not stale yet; refusing to mark "
+                    "it abandoned. Retry once `accounting show` reports it as stale."
+                )
 
-        return self.settle(attempt_id, operator_abandoned_settlement(), now=now, _guard=guard)
+        return self.settle(attempt_id, operator_abandoned_settlement(), now=moment, _guard=guard)
 
 
 def _slot_key(reservation: Mapping[str, Any]) -> tuple[str, str, object, str]:
@@ -1152,6 +1185,8 @@ class AttemptTracker:
         self.usage: dict[str, Any] | None = None
         self.observed: dict[str, Any] = {"model": None, "thread_id": None}
         self.output_characters: int | None = None
+        # Set once the engine has committed the published result to run state.
+        self.published = False
         self.settled = False
 
     @property
@@ -1191,6 +1226,9 @@ class AttemptTracker:
         )
 
     def failure_settlement(self, exc: BaseException) -> dict[str, Any]:
+        if self.published:
+            # A later exception (e.g. a broken stdout pipe) does not unpublish it.
+            return self.success_settlement()
         interrupted = isinstance(exc, KeyboardInterrupt)
         if self.execution is None:
             # The process never returned a result to the engine.
@@ -1234,7 +1272,9 @@ class AttemptTracker:
         """Settle once. Returns None on success, else a diagnostic message.
 
         Never raises for ledger problems: a settlement failure after launch must
-        not change the engine's own outcome; the attempt stays visibly unsettled.
+        not change the engine's own outcome. The attempt then normally stays
+        visibly unsettled; when only the final sync failed, the settlement line
+        may be present without a durability guarantee.
         """
         if self.settled:
             return None

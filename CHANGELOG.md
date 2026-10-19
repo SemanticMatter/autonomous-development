@@ -22,7 +22,8 @@ Added:
   the same run, review slot and review-contract generation. Nothing is relaunched automatically.
 - `controller.py accounting summary|attempts|show` are read-only, versioned JSON queries with
   completeness and integrity diagnostics. `accounting reconcile <id> --as abandoned` is the one
-  mutating command: an explicit operator settlement for attempts whose process is gone.
+  mutating command: an explicit operator settlement for attempts whose process is gone (or,
+  where that cannot be checked, that are stale).
 - `schemas/codex-attempt-event.schema.json`: a strict allowlist that rejects prompt/output/stderr
   text, environment, absolute paths and host names.
 - `codex_runs` records and the Codex-failure note now carry the `attempt_id`. This is additive;
@@ -30,11 +31,11 @@ Added:
 
 Behavior change:
 - A Codex phase now refuses to launch when its attempt cannot be durably recorded. That happens
-  when the ledger location is unwritable, relative, set but empty, inside the target repository,
-  locked for more than 30 s, cannot be synced, has corrupt metadata, or has events but no metadata.
-  Writers never repair or replace ledger files. A settlement failure after publication keeps
-  the result and exit code 0, prints an `[accounting]` warning, and leaves the attempt visibly
-  unsettled.
+  when the ledger location is unwritable, relative, set but empty, inside the target repository
+  or the run-state home, locked for more than 30 s, cannot be synced, has corrupt metadata, or
+  has events but no metadata. Writers never repair or replace ledger files. A settlement failure
+  after publication keeps the result and exit code 0 and prints an `[accounting]` warning; the
+  attempt normally stays visibly unsettled.
 
 Known limitations:
 - A controller killed by a signal leaves its attempt unsettled, and its usage stays unknown.

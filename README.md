@@ -513,17 +513,21 @@ export CLAUDE_AUTONOMOUS_ACCOUNTING_HOME=/path/to/accounting
 ```
 
 If the attempt cannot be recorded, **Codex is not launched**. That happens when the location is
-unwritable, relative or inside the repository, the lock times out, a file or directory cannot be
-synced, the ledger metadata (`ledger.json`) is corrupt, or the metadata is missing while events
-already exist. The engine never repairs, replaces or deletes ledger files; the error says how to
+unwritable, relative, inside the repository or inside the run-state home (where deleting run state
+would delete it), the lock times out, a file or directory cannot be synced, the ledger metadata
+(`ledger.json`) is corrupt, or the metadata is missing while events already exist. If the
+reservation line was written but could not be synced, it can remain as an unsettled attempt that
+never launched; the error names it so it can be reconciled. The engine never repairs, replaces or deletes ledger files; the error says how to
 inspect them. Damage to individual event lines is tolerated: malformed or torn lines, invalid
 events, orphan or conflicting settlements, and duplicate or conflicting event ids are skipped or
 resolved first-wins, new events are appended after them, and queries report them as diagnostics.
 Writers validate the history of the attempts they act on exactly as queries do, so an invalid
 line never blocks a later valid settlement. A timestamp that is not a real date is invalid.
 Damage to the metadata is not tolerated: it refuses every write until an operator restores it.
-If recording the outcome fails after Codex ran, the engine result is kept, a
-`[accounting]` warning is printed and the attempt stays visibly unsettled.
+If recording the outcome fails after Codex ran, the engine result is kept and a
+`[accounting]` warning is printed. The attempt then normally stays visibly unsettled; if only the
+final sync failed, it may show as settled without a durability guarantee. An exception after the
+result was published (for example a broken output pipe) still records the attempt as `published`.
 
 A new invocation gets a new attempt id. When the previous attempt for the same run, review slot
 (for example `review-01`) and review-contract generation was not published, `retry_of` links to
@@ -548,8 +552,10 @@ controller.py accounting show <attempt-id>
 
 `reconcile` is the only mutating accounting command. It takes the ledger lock and appends one
 operator settlement (`unknown` execution and result, `unavailable` usage) to the resolved
-accounting home. It is refused while the launching controller may still be alive, and it never
-relaunches Codex:
+accounting home. It is refused while the launching controller may still be alive: it needs
+`owner_process` `gone`, or `unknown` together with `stale` (on hosts without a boot id, such as
+macOS and Windows, that means waiting until the attempt is stale). An unknown attempt id is
+refused without creating anything. It never relaunches Codex:
 
 ```bash
 controller.py accounting reconcile <attempt-id> --as abandoned

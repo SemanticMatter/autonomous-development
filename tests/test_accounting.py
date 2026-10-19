@@ -1087,6 +1087,57 @@ class LedgerTests(_TempDirs):
         with self.assertRaises(accounting.SettlementConflict):
             self.ledger.reconcile_abandoned(engine_settled.attempt_id, boot_id=OTHER_BOOT)
 
+    def test_reconcile_refuses_an_unknown_owner_until_stale(self) -> None:  # AT-21, AT-18
+        res = self.ledger.reserve(make_reservation(timeout=60.0))
+        before = self.events_path().read_bytes()
+        unknown_owner = {
+            "no-boot-id": {"boot_id": None},  # every non-Linux host
+            "pid-check-unavailable": {"boot_id": BOOT, "pid_alive": lambda pid: None},
+        }
+        for name, kwargs in unknown_owner.items():
+            with self.subTest(case=name), self.assertRaises(accounting.AccountingError) as ctx:
+                self.ledger.reconcile_abandoned(res.attempt_id, **kwargs)
+            self.assertIn("not stale yet", str(ctx.exception))
+        self.assertEqual(self.events_path().read_bytes(), before)
+        later = accounting.utc_now() + dt.timedelta(seconds=60 + accounting.STALE_GRACE_SECONDS + 1)
+        self.assertEqual(
+            self.ledger.reconcile_abandoned(res.attempt_id, now=later, boot_id=None), "written"
+        )
+
+    def test_failed_reconcile_creates_nothing(self) -> None:  # AT-21, AT-29
+        unknown = "cxa-20260101T000000Z-0000000000000000"
+        with self.assertRaises(accounting.AccountingError) as ctx:
+            self.ledger.reconcile_abandoned(unknown, boot_id=OTHER_BOOT)
+        self.assertIn("nothing was written", str(ctx.exception))
+        self.assertFalse(self.home.exists())
+        self.ledger.reserve(make_reservation())
+        before = tree_snapshot(self.home)
+        with self.assertRaises(accounting.AccountingError):
+            self.ledger.reconcile_abandoned(unknown, boot_id=OTHER_BOOT)
+        self.assertEqual(tree_snapshot(self.home), before)
+
+    def test_reservation_sync_failure_names_the_possibly_recorded_attempt(self) -> None:  # AT-41
+        self.ledger.reserve(make_reservation())
+        with mock.patch.object(
+            accounting.os, "fsync", fail_fsync_on("file", errno.EIO, only=self.events_path())
+        ), self.assertRaises(accounting.AccountingError) as ctx:
+            self.ledger.reserve(make_reservation(slot="review-02"))
+        [orphan] = [
+            a for a in accounting.read_ledger(self.home).attempts.values()
+            if a.reservation["slot"] == "review-02"
+        ]
+        self.assertIn(orphan.attempt_id, str(ctx.exception))
+        self.assertIn("never launched", str(ctx.exception))
+        self.assertEqual(
+            self.ledger.reconcile_abandoned(orphan.attempt_id, boot_id=OTHER_BOOT), "written"
+        )
+        # A reservation refused by validation writes nothing and names no attempt.
+        bad = make_reservation(slot="review-03")
+        bad["workflow"]["cwd"] = "/somewhere"
+        with self.assertRaises(accounting.AccountingError) as ctx:
+            self.ledger.reserve(bad)
+        self.assertNotIn("never launched", str(ctx.exception))
+
     def test_engine_provenance_digest(self) -> None:
         root = self.tmp / "plugin"
         for rel in ("scripts", "schemas", "prompts", ".claude-plugin"):
@@ -1401,6 +1452,8 @@ class CodexAttemptAccountingTests(unittest.TestCase):
             "empty": "",
             "relative": "relative/acct",
             "inside-repo": str(self.repo / ".acct"),
+            "inside-state-home": str(self.state_home / "acct"),
+            "inside-run-dir": str(self.run_dir / "acct"),
             "corrupt-meta": str(corrupt),
         }
         self.fake()
@@ -1413,6 +1466,8 @@ class CodexAttemptAccountingTests(unittest.TestCase):
         self.assertEqual(self.calls, [])
         self.assertEqual(self.state_path.read_bytes(), before)
         self.assertFalse((self.repo / ".acct").exists())
+        self.assertFalse((self.state_home / "acct").exists())
+        self.assertFalse((self.run_dir / "acct").exists())
 
     def test_lock_timeout_prevents_launch(self) -> None:  # AT-17
         accounting.Ledger(self.home)._ensure_dir()
@@ -1541,7 +1596,25 @@ class CodexAttemptAccountingTests(unittest.TestCase):
         self.assertEqual(attempt["state"], "unsettled")
         self.assertIn("[accounting]", err.getvalue())
         self.assertIn(attempt["attempt_id"], err.getvalue())
+        self.assertIn("UNSETTLED, or settled without a durability guarantee", err.getvalue())
         self.assertEqual(self.load_state()["reviews"][0]["verdict"], "pass")
+
+    def assert_published_despite(self, exc: BaseException) -> None:
+        class FailingStdout(io.StringIO):
+            def write(self, text: str) -> int:
+                raise exc
+
+        self.fake()
+        with contextlib.redirect_stdout(FailingStdout()), self.assertRaises(type(exc)):
+            self.run_codex()
+        self.assertEqual(len(self.load_state()["reviews"]), 1)
+        self.assertEqual(self.outcome(self.only_attempt()), ("exited", "published", None, "complete"))
+
+    def test_broken_stdout_after_publication_settles_as_published(self) -> None:  # AT-19
+        self.assert_published_despite(BrokenPipeError())
+
+    def test_interrupt_after_publication_settles_as_published(self) -> None:  # AT-19, AT-12
+        self.assert_published_despite(KeyboardInterrupt())
 
     def test_settlement_failure_on_failure_path(self) -> None:  # AT-20
         self.fake(rc=1, stderr="codex broke")
