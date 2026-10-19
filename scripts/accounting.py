@@ -56,7 +56,7 @@ import secrets
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Collection, Mapping
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from schema_validation import SchemaValidationError, validate_payload  # noqa: E402
@@ -452,6 +452,7 @@ INTEGRITY_DIAGNOSTICS = (
     "duplicate_reservations",
     "orphan_settlements",
     "conflicting_settlements",
+    "foreign_ledger_events",
 )
 
 
@@ -476,17 +477,23 @@ def _settlement_digest(event: Mapping[str, Any]) -> str:
 
 
 def _semantic_problems(event: Mapping[str, Any]) -> list[str]:
-    """Checks the schema cannot express: counter consistency per usage status.
+    """Checks the schema cannot express: a real calendar timestamp, and counter
+    consistency per usage status.
 
     Expects a schema-valid event. Used by both the writer (refuse before append)
     and validating readers (count as ``invalid_events``).
     """
+    problems: list[str] = []
+    try:
+        # The schema pattern admits e.g. month 99; queries parse this field.
+        _parse_iso(event["recorded_at"])
+    except ValueError:
+        problems.append("invalid_recorded_at")
     if event.get("event_type") != "attempt.settled":
-        return []
+        return problems
     usage = event["settlement"]["usage"]
     counters = usage["counters"]
     status = usage["status"]
-    problems: list[str] = []
     if status in {"complete", "partial"}:
         values = [counters[name] for name in COUNTER_NAMES]
         if any(isinstance(v, int) and v < 0 for v in values):
@@ -563,14 +570,26 @@ def _has_fold_shape(event: Mapping[str, Any]) -> bool:
     return False
 
 
-def read_ledger(home: Path, *, validate: bool = True) -> LedgerView:
+def _event_is_valid(event: Mapping[str, Any]) -> bool:
+    try:
+        validate_payload(event, EVENT_SCHEMA, label="accounting ledger event")
+    except SchemaValidationError:
+        return False
+    return _semantically_valid(event)
+
+
+def read_ledger(
+    home: Path, *, validate: bool = True, validate_attempts: Collection[str] = ()
+) -> LedgerView:
     """Fold the ledger at `home` without locking, creating or modifying anything.
 
     Queries use full schema + semantic validation (``validate=True``). Writers fold
     with ``validate=False``, which only checks the fields that retry linkage and
-    duplicate detection use: every line was schema-validated when it was written,
-    and full validation of the whole history under the lock would make each
-    launch O(history) in jsonschema calls (~0.2 ms per event).
+    duplicate detection use, because full validation of the whole history under
+    the lock would make each launch O(history) in jsonschema calls (~0.2 ms per
+    event). Lines can be damaged or hand-edited after they were written, so the
+    events of the attempts a writer decides on (``validate_attempts``) are still
+    fully validated: for those attempts the writer sees what queries see.
     """
     ledger_dir = home / LEDGER_VERSION_DIR
     meta_status, ledger_id = _read_meta(ledger_dir / META_FILE_NAME)
@@ -606,13 +625,9 @@ def read_ledger(home: Path, *, validate: bool = True) -> LedgerView:
         if event.get("format") != EVENT_FORMAT:
             view.diagnostics["unsupported_format"] += 1
             continue
-        if validate:
-            try:
-                validate_payload(event, EVENT_SCHEMA, label="accounting ledger event")
-            except SchemaValidationError:
-                view.diagnostics["invalid_events"] += 1
-                continue
-            if not _semantically_valid(event):
+        attempt_ref = event.get("attempt_id")
+        if validate or (isinstance(attempt_ref, str) and attempt_ref in validate_attempts):
+            if not _event_is_valid(event):
                 view.diagnostics["invalid_events"] += 1
                 continue
         elif not _has_fold_shape(event):
@@ -739,6 +754,21 @@ def _fsync_dir(path: Path) -> None:
         os.close(fd)
 
 
+def _fsync_file(path: Path) -> None:
+    """Sync an existing file's contents; raises AccountingError on failure."""
+    try:
+        # Windows `fsync` (`_commit`) needs a writable descriptor; nothing is written.
+        fd = os.open(str(path), os.O_RDWR if os.name == "nt" else os.O_RDONLY)
+    except OSError as exc:
+        raise AccountingError(f"Cannot open {path} to sync it: {exc}") from exc
+    try:
+        os.fsync(fd)
+    except OSError as exc:
+        raise AccountingError(f"Cannot sync {path}: {exc}") from exc
+    finally:
+        os.close(fd)
+
+
 def _remove_partial(path: Path) -> str:
     """Remove a file this writer just created and failed to complete (under the lock)."""
     try:
@@ -813,6 +843,9 @@ class Ledger:
         status, ledger_id = _read_meta(self.meta_path)
         if status == "ok":
             assert ledger_id is not None
+            # Its creator may have been interrupted between write and fsync: confirm
+            # the contents are durable before recording events under this id.
+            _fsync_file(self.meta_path)
             return ledger_id
         if status == "invalid":
             if self._has_recorded_events():
@@ -939,8 +972,14 @@ class Ledger:
             ledger_id = self._ensure_meta()
             self._ensure_events_file()
             _fsync_dir(self.dir)  # confirm the file entries, whoever created them
-            view = read_ledger(self.home, validate=False)
             key = _slot_key(reservation)
+            view = read_ledger(self.home, validate=False)
+            same_slot_ids = {
+                rec.attempt_id for rec in view.attempts.values() if _slot_key(rec.reservation) == key
+            }
+            if same_slot_ids:
+                # Link from the slot's fully validated history, as queries see it.
+                view = read_ledger(self.home, validate=False, validate_attempts=same_slot_ids)
             same_slot = [rec for rec in view.attempts.values() if _slot_key(rec.reservation) == key]
             # A retry follows the immediately preceding attempt in the slot when that
             # attempt did not publish (rejected, failed or still unsettled).
@@ -982,12 +1021,16 @@ class Ledger:
             # Reject an invalid new settlement before looking at history, so the
             # outcome does not depend on what is already recorded.
             _validate_new_event(event)
-            view = read_ledger(self.home, validate=False)
+            # An invalid earlier settlement is not authoritative, exactly as in queries.
+            view = read_ledger(self.home, validate=False, validate_attempts={attempt_id})
             record = view.attempts.get(attempt_id)
             if record is None:
                 raise AccountingError(f"Unknown attempt {attempt_id!r}; nothing to settle.")
             if record.settled is not None:
                 if _settlement_digest(record.settled) == _settlement_digest(event):
+                    # The identical line may come from a writer whose fsync failed:
+                    # confirm it is durable before reporting it as recorded.
+                    _fsync_file(self.events_path)
                     return "duplicate"
                 raise SettlementConflict(
                     f"Attempt {attempt_id} is already settled with a different "
@@ -1372,7 +1415,11 @@ def summary_query(
             "including_partial": _token_totals(settled, {"complete", "partial"}),
         },
         "completeness": {
-            "tokens_complete": not unsettled and without_complete == 0 and view.integrity_ok(),
+            # An absent ledger (e.g. a mistyped --ledger-dir) is not complete.
+            "tokens_complete": view.present
+            and not unsettled
+            and without_complete == 0
+            and view.integrity_ok(),
             "attempts_without_complete_usage": without_complete + len(unsettled),
         },
         "diagnostics": dict(view.diagnostics),

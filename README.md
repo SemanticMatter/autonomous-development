@@ -519,6 +519,8 @@ already exist. The engine never repairs, replaces or deletes ledger files; the e
 inspect them. Damage to individual event lines is tolerated: malformed or torn lines, invalid
 events, orphan or conflicting settlements, and duplicate or conflicting event ids are skipped or
 resolved first-wins, new events are appended after them, and queries report them as diagnostics.
+Writers validate the history of the attempts they act on exactly as queries do, so an invalid
+line never blocks a later valid settlement. A timestamp that is not a real date is invalid.
 Damage to the metadata is not tolerated: it refuses every write until an operator restores it.
 If recording the outcome fails after Codex ran, the engine result is kept, a
 `[accounting]` warning is printed and the attempt stays visibly unsettled.
@@ -531,9 +533,11 @@ a reused slot name is not linked across it. Nothing is ever relaunched automatic
 set `CLAUDE_AUTONOMOUS_HOST_LABEL` (for example `work`) to label attempts; host names are never
 recorded.
 
-Queries print compact, versioned JSON with completeness indicators and diagnostics. They are
-read-only: they take no lock, create nothing, and accept `--ledger-dir DIR` to read another
-accounting home:
+Queries print compact, versioned JSON with completeness indicators and diagnostics.
+`completeness.tokens_complete` is true only when the ledger exists, every matching attempt is
+settled with `complete` (or `not_applicable`) usage, and no integrity diagnostic is set; events
+recorded under another `ledger_id` count as an integrity problem. Queries are read-only: they
+take no lock, create nothing, and accept `--ledger-dir DIR` to read another accounting home:
 
 ```bash
 controller.py accounting summary  [--filter-repo-id ID] [--filter-run-id ID] [--since ISO]

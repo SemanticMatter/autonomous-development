@@ -922,6 +922,113 @@ class LedgerTests(_TempDirs):
         self.assertEqual(view.attempts[first.attempt_id].reservation["prompt_characters"], 10)
         self.assertIn(second.attempt_id, view.attempts)
 
+    def published_settlement(self, res: accounting.Reservation, **counters) -> dict:
+        tracker = accounting.AttemptTracker(self.ledger, res)
+        tracker.record_process(
+            returncode=0, timed_out=False, duration_seconds=1.0,
+            stdout_text=ndjson({**FULL_USAGE, **counters}), stdout_truncated=False,
+            observed_model=None,
+        )
+        return tracker.success_settlement()
+
+    def inject_settlement(self, res: accounting.Reservation, settlement: dict, **overrides) -> None:
+        event = self.ledger._event(
+            "attempt.settled", res.attempt_id, res.ledger_id, accounting.utc_now(),
+            settlement=settlement,
+        )
+        inject_events(self.home, {**event, **overrides})
+
+    def test_writers_ignore_invalid_earlier_settlements_like_queries(self) -> None:  # AT-31, AT-33
+        semantic = self.ledger.reserve(make_reservation())
+        schema = self.ledger.reserve(make_reservation(slot="review-02"))
+        bad_counters = self.published_settlement(semantic)
+        bad_counters["usage"]["counters"]["cached_input_tokens"] = 5000  # schema-valid only
+        self.inject_settlement(semantic, bad_counters)
+        self.inject_settlement(schema, self.published_settlement(schema), prompt="x")  # fold shape only
+        before = self.summary()
+        self.assertEqual(before["attempts"]["unsettled"], 2)
+        self.assertEqual(before["diagnostics"]["invalid_events"], 2)
+        # Both attempts stay settleable: the invalid lines are not authoritative.
+        self.assertEqual(
+            self.ledger.settle(semantic.attempt_id, self.published_settlement(semantic)), "written"
+        )
+        self.assertEqual(self.ledger.reconcile_abandoned(schema.attempt_id, boot_id=OTHER_BOOT), "written")
+        after = self.summary()
+        self.assertEqual(after["attempts"]["settled"], 2)
+        self.assertEqual(after["result"], {"published": 1, "unknown": 1})
+        self.assertEqual(after["diagnostics"]["invalid_events"], 2)
+        self.assertEqual(after["diagnostics"]["conflicting_settlements"], 0)
+
+    def test_retry_linkage_ignores_an_invalid_settlement_like_queries(self) -> None:  # AT-26, AT-33
+        first = self.ledger.reserve(make_reservation())
+        bogus = self.published_settlement(first)
+        bogus["usage"]["counters"]["reasoning_output_tokens"] = 5000
+        self.inject_settlement(first, bogus)
+        second = self.ledger.reserve(make_reservation())
+        self.assertEqual((second.retry_of, second.slot_attempt), (first.attempt_id, 2))
+        self.assertTrue(second.predecessor_unsettled)
+        self.assertIsNone(accounting.read_ledger(self.home).attempts[first.attempt_id].settled)
+
+    def test_calendar_invalid_timestamps_are_invalid_events(self) -> None:  # AT-31, AT-30
+        good = self.ledger.reserve(make_reservation())
+        line = json.loads(self.events_path().read_text().splitlines()[0])
+        bad = {
+            **line,
+            "event_id": "f" * 32,
+            "attempt_id": "cxa-20260101T000000Z-00000000000000ee",
+            "recorded_at": "2026-99-19T12:00:00+00:00",
+        }
+        inject_events(self.home, bad)
+        result = self.summary()
+        self.assertEqual(result["diagnostics"]["invalid_events"], 1)
+        self.assertEqual(result["attempts"]["total"], 1)
+        for argv in (
+            ["summary"],
+            ["summary", "--since", "2026-01-01T00:00:00Z"],
+            ["attempts", "--unsettled"],
+            ["show", good.attempt_id],
+        ):
+            with self.subTest(argv=argv):
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    self.assertEqual(
+                        controller.main(["accounting", *argv, "--ledger-dir", str(self.home)]), 0
+                    )
+                self.assertEqual(json.loads(out.getvalue())["diagnostics"]["invalid_events"], 1)
+        with self.assertRaises(accounting.AccountingError) as ctx:
+            accounting._validate_new_event(bad)
+        self.assertIn("invalid_recorded_at", str(ctx.exception))
+
+    def test_foreign_ledger_events_and_absent_ledger_are_not_complete(self) -> None:  # AT-30, AT-43
+        self.assertFalse(self.summary()["ledger"]["present"])
+        self.assertFalse(self.summary()["completeness"]["tokens_complete"])
+        settle_published(self.ledger, self.ledger.reserve(make_reservation()))
+        self.assertTrue(self.summary()["completeness"]["tokens_complete"])
+        meta = json.loads(self.meta_path().read_text())
+        self.meta_path().write_text(json.dumps({**meta, "ledger_id": "e" * 32}))
+        result = self.summary()
+        self.assertEqual(result["diagnostics"]["foreign_ledger_events"], 2)
+        self.assertFalse(result["completeness"]["tokens_complete"])
+
+    def test_existing_metadata_and_duplicate_settlements_are_synced(self) -> None:  # AT-41
+        res = self.ledger.reserve(make_reservation())
+        settlement = self.published_settlement(res)
+        self.assertEqual(self.ledger.settle(res.attempt_id, settlement), "written")
+        before = self.events_path().read_bytes()
+        # Writers confirm metadata created by someone else before using its id ...
+        with mock.patch.object(
+            accounting.os, "fsync", fail_fsync_on("file", errno.EIO, only=self.meta_path())
+        ), self.assertRaises(accounting.AccountingError) as ctx:
+            self.ledger.reserve(make_reservation(slot="review-02"))
+        self.assertIn("Cannot sync", str(ctx.exception))
+        # ... and a duplicate settlement is only reported once its line is durable.
+        with mock.patch.object(
+            accounting.os, "fsync", fail_fsync_on("file", errno.EIO, only=self.events_path())
+        ), self.assertRaises(accounting.AccountingError):
+            self.ledger.settle(res.attempt_id, settlement)
+        self.assertEqual(self.events_path().read_bytes(), before)
+        self.assertEqual(self.ledger.settle(res.attempt_id, settlement), "duplicate")
+
     def test_retry_linkage_does_not_cross_contract_generations(self) -> None:  # AT-26, AT-44
         before_refresh = self.ledger.reserve(make_reservation(generation=1))
         settle_rejected(self.ledger, before_refresh, "schema_invalid")
