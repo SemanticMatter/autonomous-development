@@ -423,7 +423,9 @@ controller.py run-check --name unit-tests --failure-tail-lines 80 -- pytest -q
 ```
 
 Codex phases run with `codex exec --json`, retain the NDJSON event stream, and record per-phase
-usage. Inspect it with:
+usage for published results in the run state. Every attempt, including failed and rejected ones,
+is also recorded durably outside run state; see [Codex attempt accounting](#codex-attempt-accounting).
+Inspect the per-run view with:
 
 ```bash
 controller.py usage-report
@@ -469,6 +471,95 @@ controller.py init --feature "..."
 
 On macOS the default is `~/Library/Application Support/claude-autonomous/`.
 On Windows the default is `%LOCALAPPDATA%\claude-autonomous\`.
+
+## Codex attempt accounting
+
+Every `controller.py codex` invocation is recorded in a per-host, append-only ledger that lives
+outside run state, so deleting a run directory or a temporary `--state-dir` never deletes it.
+The attempt is reserved **before** `codex exec` starts and settled once afterwards. The settlement
+has three independent outcomes:
+
+- `execution`: `exited`, `timed_out`, `interrupted`, `launch_failed` or `unknown`.
+- `result`: whether the engine `published` the Codex result, or `rejected` it and why (for example
+  `nonzero_exit`, `schema_invalid`, `run_inactive` or `contract_drift`).
+- `usage`: `complete`, `partial`, `unavailable`, `invalid` or `not_applicable`. Counters are
+  `input_tokens`, `cached_input_tokens` (a subset of input), `output_tokens` and
+  `reasoning_output_tokens` (a subset of output). Usage is kept for failed and rejected attempts.
+
+The ledger location does **not** follow `--state-dir` or `CLAUDE_AUTONOMOUS_STATE_HOME`:
+
+```bash
+# 1. Explicit accounting home (must be an absolute path outside the reviewed repository)
+export CLAUDE_AUTONOMOUS_ACCOUNTING_HOME=/path/to/accounting
+# 2. $XDG_STATE_HOME/claude-autonomous-accounting/ (absolute XDG values only)
+# 3. Default: ~/.local/state/claude-autonomous-accounting/
+#    (macOS: ~/Library/Application Support/claude-autonomous-accounting/,
+#     Windows: %LOCALAPPDATA%\claude-autonomous-accounting\)
+```
+
+If the attempt cannot be recorded, **Codex is not launched**. That happens when the location is
+unwritable, relative or inside the repository, the lock times out, a file or directory cannot be
+synced, the ledger metadata (`ledger.json`) is corrupt, or the metadata is missing while events
+already exist. The engine never repairs, replaces or deletes ledger files; the error says how to
+inspect them. Damage to individual event lines is tolerated: malformed or torn lines, invalid
+events, orphan or conflicting settlements, and duplicate or conflicting event ids are skipped or
+resolved first-wins, new events are appended after them, and queries report them as diagnostics.
+Damage to the metadata is not tolerated: it refuses every write until an operator restores it.
+If recording the outcome fails after Codex ran, the engine result is kept, a
+`[accounting]` warning is printed and the attempt stays visibly unsettled.
+
+A new invocation gets a new attempt id. When the previous attempt for the same run, review slot
+(for example `review-01`) and review-contract generation was not published, `retry_of` links to
+it. This is bookkeeping only: it does not prove that both attempts saw identical inputs, and it
+authorizes nothing. `import-pr --refresh` that supersedes the reviews starts a new generation, so
+a reused slot name is not linked across it. Nothing is ever relaunched automatically. Optionally
+set `CLAUDE_AUTONOMOUS_HOST_LABEL` (for example `work`) to label attempts; host names are never
+recorded.
+
+Queries print compact, versioned JSON with completeness indicators and diagnostics. They are
+read-only: they take no lock, create nothing, and accept `--ledger-dir DIR` to read another
+accounting home:
+
+```bash
+controller.py accounting summary  [--filter-repo-id ID] [--filter-run-id ID] [--since ISO]
+controller.py accounting attempts [--filter-repo-id ID] [--filter-run-id ID] [--since ISO] \
+                                  [--unsettled] [--limit N]
+controller.py accounting show <attempt-id>
+```
+
+`reconcile` is the only mutating accounting command. It takes the ledger lock and appends one
+operator settlement (`unknown` execution and result, `unavailable` usage) to the resolved
+accounting home. It is refused while the launching controller may still be alive, and it never
+relaunches Codex:
+
+```bash
+controller.py accounting reconcile <attempt-id> --as abandoned
+```
+
+Guarantees and limits:
+
+- Each event is one line written with a single append and `fsync`ed before the call returns.
+  New files and directories are also synced into their parent directory, and every write
+  re-syncs the ledger's own directory entries itself rather than trusting another writer's
+  initialization; a sync error refuses the write. Directory sync is skipped only where it is unsupported (Windows, or file systems that
+  reject it with `EINVAL`/`ENOTSUP`). This survives a crash of the controller. It survives OS crash
+  or power loss only as far as the storage stack honors `fsync`; that has not been verified for
+  WSL2's virtual disk, and the offline tests only inject faults into these calls.
+- A crash mid-append damages at most the last line. Readers report it (`incomplete_tail`,
+  `malformed_lines`) and the next append starts on a fresh line. Settled lines are never rewritten.
+- Replayed or duplicated lines are reported as diagnostics and are never counted twice.
+- An attempt whose controller was killed (for example by SIGTERM or SIGKILL) stays unsettled,
+  with `owner_process` reported as `alive`, `gone` or `unknown` (PID reuse makes `alive`
+  advisory). It is reported as `stale` once it is older than its timeout plus five minutes. Its
+  usage stays unknown, and the engine does not stop a Codex child that outlives the controller.
+- `partial`, `unavailable` and `invalid` usage are counted separately and never treated as
+  complete; `tokens.complete_only` and `tokens.including_partial` are reported side by side.
+- The ledger is not protected against other processes running as the same user. Locking is not
+  supported on network or `drvfs` (`/mnt/c`) file systems.
+- No prompt, output or stderr text, environment, absolute path, host name or credential is
+  recorded; the event schema (`schemas/codex-attempt-event.schema.json`) rejects unlisted fields.
+- Token counts are not currency costs. Historical runs are not imported; `usage-report` remains
+  the per-run view of published phases.
 
 ## State and generated artifacts
 
