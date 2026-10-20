@@ -999,6 +999,51 @@ class LedgerTests(_TempDirs):
             accounting._validate_new_event(bad)
         self.assertIn("invalid_recorded_at", str(ctx.exception))
 
+    def test_timestamp_validity_does_not_depend_on_the_python_version(self) -> None:  # AT-31, AT-30
+        # datetime.fromisoformat accepts hour 24 from Python 3.14 on; the schema
+        # pattern alone decides it, so the same line is invalid on every version.
+        self.ledger.reserve(make_reservation())
+        line = json.loads(self.events_path().read_text().splitlines()[0])
+        utc = dt.timezone.utc
+        valid = [
+            accounting._iso(moment)  # exactly what the writer emits
+            for moment in (
+                dt.datetime(2026, 1, 1, 0, 0, 0, tzinfo=utc),
+                dt.datetime(2026, 12, 31, 23, 59, 59, 999999, tzinfo=utc),
+                dt.datetime(2028, 2, 29, 12, 0, 0, tzinfo=utc),
+                dt.datetime(2027, 1, 1, 1, 30, tzinfo=dt.timezone(dt.timedelta(hours=2))),
+            )
+        ] + ["2026-01-01T23:59:59Z"]
+        self.assertIn("2026-12-31T23:59:59+00:00", valid)
+        invalid = [
+            "2026-01-01T24:00:00+00:00",
+            "2026-12-31T24:00:00Z",
+            "2026-01-01T24:00:01+00:00",
+            "2026-01-01T23:60:00+00:00",
+            "2026-01-01T23:59:60+00:00",
+            "2026-02-30T00:00:00+00:00",
+        ]
+        events = [
+            {
+                **line,
+                "event_id": f"{index:032x}",
+                "attempt_id": f"cxa-20260101T000000Z-{index:016x}",
+                "recorded_at": recorded_at,
+            }
+            for index, recorded_at in enumerate(valid + invalid, start=1)
+        ]
+        for event in events:
+            with self.subTest(recorded_at=event["recorded_at"]):
+                if event["recorded_at"] in valid:
+                    accounting._validate_new_event(event)
+                else:
+                    with self.assertRaises(accounting.AccountingError):
+                        accounting._validate_new_event(event)
+        inject_events(self.home, *events)
+        result = self.summary()
+        self.assertEqual(result["diagnostics"]["invalid_events"], len(invalid))
+        self.assertEqual(result["attempts"]["total"], 1 + len(valid))
+
     def test_foreign_ledger_events_and_absent_ledger_are_not_complete(self) -> None:  # AT-30, AT-43
         self.assertFalse(self.summary()["ledger"]["present"])
         self.assertFalse(self.summary()["completeness"]["tokens_complete"])

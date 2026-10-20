@@ -501,7 +501,12 @@ has three independent outcomes:
   `input_tokens`, `cached_input_tokens` (a subset of input), `output_tokens` and
   `reasoning_output_tokens` (a subset of output). Usage is kept for failed and rejected attempts.
 
-The ledger location does **not** follow `--state-dir` or `CLAUDE_AUTONOMOUS_STATE_HOME`:
+The ledger location does **not** follow `--state-dir` or `CLAUDE_AUTONOMOUS_STATE_HOME`, and it
+must not lie inside the effective run-state home. That also excludes a state home set to a broad
+parent of the accounting home, such as `$XDG_STATE_HOME` itself. Such a launch is refused, and
+there is no bypass. Keep the two locations disjoint: point `--state-dir` or
+`CLAUDE_AUTONOMOUS_STATE_HOME` at its own directory, or set `CLAUDE_AUTONOMOUS_ACCOUNTING_HOME`
+outside the state home.
 
 ```bash
 # 1. Explicit accounting home (must be an absolute path outside the reviewed repository)
@@ -522,7 +527,9 @@ inspect them. Damage to individual event lines is tolerated: malformed or torn l
 events, orphan or conflicting settlements, and duplicate or conflicting event ids are skipped or
 resolved first-wins, new events are appended after them, and queries report them as diagnostics.
 Writers validate the history of the attempts they act on exactly as queries do, so an invalid
-line never blocks a later valid settlement. A timestamp that is not a real date is invalid.
+line never blocks a later valid settlement. Timestamps must have the form the engine writes,
+`YYYY-MM-DDTHH:MM:SS+00:00` (or `Z`), with a real date and hours `00`–`23`. Any other value,
+including hour `24`, is invalid on every supported Python version.
 Damage to the metadata is not tolerated: it refuses every write until an operator restores it.
 If recording the outcome fails after Codex ran, the engine result is kept and a
 `[accounting]` warning is printed. The attempt then normally stays visibly unsettled; if only the
@@ -553,9 +560,15 @@ controller.py accounting show <attempt-id>
 `reconcile` is the only mutating accounting command. It takes the ledger lock and appends one
 operator settlement (`unknown` execution and result, `unavailable` usage) to the resolved
 accounting home. It is refused while the launching controller may still be alive: it needs
-`owner_process` `gone`, or `unknown` together with `stale` (on hosts without a boot id, such as
-macOS and Windows, that means waiting until the attempt is stale). An unknown attempt id is
-refused without creating anything. It never relaunches Codex:
+`owner_process` `gone`, or `unknown` together with `stale`. There is no override. This trades
+waiting for safety: a controller that is still running would otherwise have its own settlement
+refused. On hosts without a boot id, such as macOS and Windows, the owner is always `unknown`, so
+an operator waits until the attempt is stale: its timeout plus five minutes, which is 65 minutes
+by default and 24 hours when the timeout is disabled. While a process with the recorded PID is
+running on the same boot, the owner is `alive` and reconcile is refused, even if that process is
+an unrelated one that reused the PID. Reconcile becomes possible once that process exits or the
+host reboots. An unknown attempt id is refused without creating anything. It never relaunches
+Codex:
 
 ```bash
 controller.py accounting reconcile <attempt-id> --as abandoned
