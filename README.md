@@ -504,7 +504,8 @@ has three independent outcomes:
 The ledger location does **not** follow `--state-dir` or `CLAUDE_AUTONOMOUS_STATE_HOME`, and it
 must not lie inside the effective run-state home. That also excludes a state home set to a broad
 parent of the accounting home, such as `$XDG_STATE_HOME` itself. Such a launch is refused, and
-there is no bypass. Keep the two locations disjoint: point `--state-dir` or
+there is no bypass. Only this direction is checked: a run-state home inside the accounting home
+is not refused, although it is not recommended. To fix a refusal, point `--state-dir` or
 `CLAUDE_AUTONOMOUS_STATE_HOME` at its own directory, or set `CLAUDE_AUTONOMOUS_ACCOUNTING_HOME`
 outside the state home.
 
@@ -529,7 +530,8 @@ resolved first-wins, new events are appended after them, and queries report them
 Writers validate the history of the attempts they act on exactly as queries do, so an invalid
 line never blocks a later valid settlement. Timestamps must have the form the engine writes,
 `YYYY-MM-DDTHH:MM:SS+00:00` (or `Z`), with a real date and hours `00`–`23`. Any other value,
-including hour `24`, is invalid on every supported Python version.
+including hour `24`, is invalid on every supported Python version. This applies to stored ledger
+events only, not to the `--since` query argument (see below).
 Damage to the metadata is not tolerated: it refuses every write until an operator restores it.
 If recording the outcome fails after Codex ran, the engine result is kept and a
 `[accounting]` warning is printed. The attempt then normally stays visibly unsettled; if only the
@@ -547,8 +549,11 @@ recorded.
 Queries print compact, versioned JSON with completeness indicators and diagnostics.
 `completeness.tokens_complete` is true only when the ledger exists, every matching attempt is
 settled with `complete` (or `not_applicable`) usage, and no integrity diagnostic is set; events
-recorded under another `ledger_id` count as an integrity problem. Queries are read-only: they
-take no lock, create nothing, and accept `--ledger-dir DIR` to read another accounting home:
+recorded under another `ledger_id` count as an integrity problem. Replacement `ledger.json`
+metadata that is itself valid does not stop writers: they keep appending under the new id, the
+earlier events stay in place, and `tokens_complete` stays false until an operator resolves the
+mismatch. Queries are read-only: they take no lock, create nothing, and accept `--ledger-dir DIR`
+to read another accounting home:
 
 ```bash
 controller.py accounting summary  [--filter-repo-id ID] [--filter-run-id ID] [--since ISO]
@@ -556,6 +561,11 @@ controller.py accounting attempts [--filter-repo-id ID] [--filter-run-id ID] [--
                                   [--unsettled] [--limit N]
 controller.py accounting show <attempt-id>
 ```
+
+`--since` is parsed by the interpreter's `datetime.fromisoformat`, so a few spellings depend on the
+Python version. Notably, hour `24` is read as the next midnight on Python 3.14 and rejected on
+3.11 and 3.12. Use hours `00`–`23` for portable queries. This affects only which attempts a query
+selects (the value is echoed in `filters.since`), not whether a stored ledger event is valid.
 
 `reconcile` is the only mutating accounting command. It takes the ledger lock and appends one
 operator settlement (`unknown` execution and result, `unavailable` usage) to the resolved
