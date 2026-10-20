@@ -27,6 +27,27 @@ from state import (  # noqa: E402
     resolve_repository,
 )
 
+# Codex phases record every attempt in the accounting ledger, whose location
+# deliberately ignores --state-dir; keep this module's attempts out of the real one.
+_ACCOUNTING_HOME: tempfile.TemporaryDirectory[str] | None = None
+_SAVED_ACCOUNTING_HOME_ENV: str | None = None
+
+
+def setUpModule() -> None:
+    global _ACCOUNTING_HOME, _SAVED_ACCOUNTING_HOME_ENV
+    _ACCOUNTING_HOME = tempfile.TemporaryDirectory()
+    _SAVED_ACCOUNTING_HOME_ENV = os.environ.get("CLAUDE_AUTONOMOUS_ACCOUNTING_HOME")
+    os.environ["CLAUDE_AUTONOMOUS_ACCOUNTING_HOME"] = _ACCOUNTING_HOME.name
+
+
+def tearDownModule() -> None:
+    if _SAVED_ACCOUNTING_HOME_ENV is None:
+        os.environ.pop("CLAUDE_AUTONOMOUS_ACCOUNTING_HOME", None)
+    else:
+        os.environ["CLAUDE_AUTONOMOUS_ACCOUNTING_HOME"] = _SAVED_ACCOUNTING_HOME_ENV
+    if _ACCOUNTING_HOME is not None:
+        _ACCOUNTING_HOME.cleanup()
+
 
 class ControllerTests(unittest.TestCase):
     def setUp(self) -> None:

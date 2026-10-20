@@ -2,6 +2,58 @@
 
 ## Unreleased
 
+### Durable accounting for Codex attempts
+
+Every `controller.py codex` invocation now leaves a durable attempt record outside run state.
+Previously only published results were recorded in `run-state.json` `codex_runs`, so the usage of
+failed, rejected and drift-discarded attempts was lost, and so was every record in a deleted
+`--state-dir`.
+
+Added:
+- `scripts/accounting.py`: a per-host, append-only, `fsync`ed JSON Lines ledger. It sits at
+  `CLAUDE_AUTONOMOUS_ACCOUNTING_HOME` > `$XDG_STATE_HOME/claude-autonomous-accounting` >
+  `~/.local/state/claude-autonomous-accounting`, and is independent of `--state-dir` and
+  `CLAUDE_AUTONOMOUS_STATE_HOME`.
+- An attempt is reserved before launch and settled exactly once. The settlement records separate
+  `execution`, `result` (engine acceptance/publication, with a reason) and `usage`
+  (`complete`/`partial`/`unavailable`/`invalid`/`not_applicable`) outcomes, plus the cached-input
+  and reasoning-output counters and the Codex thread id.
+- Retries get new attempt ids linked through `retry_of` to the previous unpublished attempt of
+  the same run, review slot and review-contract generation. Nothing is relaunched automatically.
+- `controller.py accounting summary|attempts|show` are read-only, versioned JSON queries with
+  completeness and integrity diagnostics. `accounting reconcile <id> --as abandoned` is the one
+  mutating command: an explicit operator settlement for attempts whose process is gone (or,
+  where that cannot be checked, that are stale).
+- `schemas/codex-attempt-event.schema.json`: a strict allowlist that rejects prompt/output/stderr
+  text, environment, absolute paths and host names.
+- `codex_runs` records and the Codex-failure note now carry the `attempt_id`. This is additive;
+  existing run state, `usage-report`, completion gates and drift checks are unchanged.
+
+Behavior change:
+- A Codex phase now refuses to launch when its attempt cannot be durably recorded. That happens
+  when the ledger location is unwritable, relative, set but empty, inside the target repository
+  or the run-state home, locked for more than 30 s, cannot be synced, has corrupt metadata, or
+  has events but no metadata. Writers never repair or replace ledger files. A settlement failure
+  after publication keeps the result and exit code 0 and prints an `[accounting]` warning; the
+  attempt normally stays visibly unsettled.
+
+Known limitations:
+- A controller killed by a signal leaves its attempt unsettled, and its usage stays unknown.
+- Durability against power loss depends on the storage stack honoring `fsync`, which is
+  unverified on WSL2.
+
+### Development checks
+
+- `tests/run_isolated.py` runs the offline test suite with a stub `codex` first on `PATH`
+  (directories holding another `codex` are dropped), scratch `HOME`/XDG/`CODEX_HOME` and no
+  provider credentials. Under a plain `unittest discover` from a normal shell, the `doctor`
+  tests could run a real `codex` found on `PATH`. `make test` now uses it. It is environment
+  isolation, not a sandbox: tests keep normal file-system and network access.
+- `.pre-commit-config.yaml`: non-modifying JSON/TOML/YAML and debug-statement checks, the
+  end-of-file, line-ending and trailing-whitespace fixers, `validate_project.py`, and the
+  isolated test suite on the `manual`/`pre-push` stages. `make precommit` runs it, and the
+  `dev` extra declares `pre-commit`.
+
 ### Review round 12 — fixes from the twelfth review (both tracks, PR #4)
 
 Both tracks verified every round-10 and round-11 fix, including against probes

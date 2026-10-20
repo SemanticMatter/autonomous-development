@@ -69,6 +69,7 @@ from state import (
     LEGACY_STATE_REL,
 )
 from schema_validation import SchemaValidationError, validate_payload
+import accounting
 
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
 PHASE_OUTPUTS = {
@@ -6742,6 +6743,211 @@ def cmd_codex(args: argparse.Namespace) -> int:
     # exec if either resolves inside the target worktree (see
     # `_require_codex_env_paths_outside_repo`).
     _require_codex_env_paths_outside_repo(codex_env, repo)
+    # Accounting: durably reserve this attempt BEFORE launching Codex (a ledger that
+    # cannot be written refuses the launch rather than spending untracked). Once
+    # reserved, every exit path settles it exactly once; see scripts/accounting.py.
+    tracker = _reserve_codex_attempt(
+        args,
+        repo=repo,
+        state_home=state_home,
+        run_ref=run_ref,
+        state=state,
+        phase=phase,
+        output_name=output_name,
+        is_delta_review=is_delta_review,
+        profile=profile,
+        prompt=prompt,
+    )
+    try:
+        exit_code = _run_reserved_codex_attempt(
+            tracker,
+            args=args,
+            repo=repo,
+            run_ref=run_ref,
+            state=state,
+            run_dir=run_dir,
+            phase=phase,
+            schema_rel=schema_rel,
+            output_name=output_name,
+            is_delta_review=is_delta_review,
+            prompt=prompt,
+            profile=profile,
+            command=command,
+            codex_env=codex_env,
+            output_path=output_path,
+            stage_id=stage_id,
+            pre_exec_identity=pre_exec_identity,
+            pre_exec_contract=pre_exec_contract,
+        )
+    except BaseException as exc:
+        _warn_unsettled(tracker, tracker.settle(tracker.failure_settlement(exc)))
+        raise
+    _warn_unsettled(tracker, tracker.settle(tracker.success_settlement()))
+    return exit_code
+
+
+def _accounting_workflow_kind(state: Mapping[str, Any]) -> str:
+    """feature / existing_pr_review / unknown (feature runs carry no explicit kind)."""
+    if is_imported_run(state):
+        return "existing_pr_review"
+    return "feature" if state.get("workflow_kind") in (None, "feature") else "unknown"
+
+
+def _accounting_contract_generation(state: Mapping[str, Any]) -> int | None:
+    """An imported run's review-contract generation (None for feature runs).
+
+    `import-pr --refresh` bumps it when it supersedes the reviews and restarts
+    review/adversarial numbering, so the ledger keys retry linkage on it."""
+    snapshot = review_contract_snapshot(state)
+    generation = snapshot.get("generation") if snapshot else None
+    if isinstance(generation, int) and not isinstance(generation, bool) and generation >= 1:
+        return generation
+    return None
+
+
+def _recorded_pr_ref(state: Mapping[str, Any]) -> dict[str, int] | None:
+    """The PR number an imported run already records, if it is a clean integer."""
+    target = state.get("review_target")
+    raw = target.get("pr_number") if isinstance(target, dict) else None
+    if isinstance(raw, str) and re.fullmatch(r"[0-9]{1,9}", raw.strip()):
+        raw = int(raw.strip())
+    if isinstance(raw, int) and not isinstance(raw, bool) and raw >= 1:
+        return {"number": raw}
+    return None
+
+
+def _reserve_codex_attempt(
+    args: argparse.Namespace,
+    *,
+    repo: RepoInfo,
+    state_home: Path,
+    run_ref: Any,
+    state: Mapping[str, Any],
+    phase: str,
+    output_name: str,
+    is_delta_review: bool,
+    profile: Mapping[str, str],
+    prompt: str,
+) -> accounting.AttemptTracker:
+    """Durably reserve one Codex attempt in the accounting ledger before launch.
+
+    Raises WorkflowError -- and Codex is NOT launched -- when the ledger cannot be
+    resolved, would live inside the target worktree or the (disposable) run-state
+    home, or cannot be written durably.
+    """
+    slot = phase if phase in {"enhance", "plan"} else output_name.removesuffix(".codex.json")
+    timeout = getattr(args, "timeout", None)
+    effective_timeout = timeout if timeout is not None else _resolve_process_timeout()
+    reservation: dict[str, Any] = {
+        "tool": "codex-exec",
+        "phase": phase,
+        "slot": slot,
+        "delta_review": bool(is_delta_review),
+        "timeout_seconds": (
+            effective_timeout if effective_timeout is not None and effective_timeout > 0 else None
+        ),
+        "launcher": {
+            "pid": os.getpid(),
+            "boot_id": accounting.current_boot_id(),
+            "host_label": accounting.host_label(),
+        },
+        "workflow": {
+            "repo_id": repo.id,
+            "run_id": run_ref.run_id,
+            "workflow_kind": _accounting_workflow_kind(state),
+            "state_home_overridden": bool(getattr(args, "state_dir", None))
+            or bool(os.environ.get("CLAUDE_AUTONOMOUS_STATE_HOME", "").strip()),
+            "review_contract_generation": _accounting_contract_generation(state),
+        },
+        "requested": {
+            "model": accounting.short_text(profile.get("model")),
+            "reasoning_effort": accounting.short_text(profile.get("reasoning")),
+            "verbosity": accounting.short_text(profile.get("verbosity")),
+            "profile_overridden": bool(
+                os.environ.get("CLAUDE_AUTONOMOUS_PHASE_PROFILES", "").strip()
+                or os.environ.get(f"CLAUDE_AUTONOMOUS_CODEX_MODEL_{phase.upper()}", "").strip()
+            ),
+        },
+        "python": accounting.python_provenance(),
+        "refs": {
+            "work_package": None,
+            "pr": _recorded_pr_ref(state),
+            "track": None,
+            "round": int(slot.rsplit("-", 1)[1]) if phase in {"review", "adversarial"} else None,
+            "context": None,
+        },
+        "prompt_characters": len(prompt),
+    }
+    try:
+        reservation["engine"] = accounting.engine_provenance(PLUGIN_ROOT)
+        home = accounting.resolve_accounting_home()
+        accounting.require_outside(home, repo.canonical_root)
+        accounting.require_outside(home, state_home, what="run-state home")
+        ledger = accounting.Ledger(home)
+        reserved = ledger.reserve(reservation)
+    except (StateError, OSError) as exc:
+        raise WorkflowError(
+            f"Codex {phase} was NOT launched: the attempt could not be recorded in "
+            f"the accounting ledger ({exc}). Fix the accounting location (see "
+            f"${accounting.ACCOUNTING_HOME_ENV}) and retry."
+        ) from exc
+    if reserved.predecessor_unsettled:
+        print(
+            f"[accounting] warning: earlier attempt {reserved.retry_of} for {slot} is "
+            "still unsettled (running, crashed, interrupted or refused before launch); "
+            f"launching {reserved.attempt_id} as its retry. Inspect it with "
+            f"`controller.py accounting show {reserved.retry_of}`.",
+            file=sys.stderr,
+        )
+    return accounting.AttemptTracker(ledger, reserved)
+
+
+def _warn_unsettled(tracker: accounting.AttemptTracker, problem: str | None) -> None:
+    """Report (never raise) a settlement failure.
+
+    The attempt normally stays unsettled; when only the final sync failed, the
+    settlement line may be present but not durable, so the message says both."""
+    if problem is None:
+        return
+    print(
+        f"[accounting] warning: attempt {tracker.attempt_id} could not be durably "
+        f"settled ({problem}). The ledger may show it UNSETTLED, or settled without a "
+        "durability guarantee. Inspect it with "
+        f"`controller.py accounting show {tracker.attempt_id}`.",
+        file=sys.stderr,
+    )
+
+
+def _is_timeout_result(result: subprocess.CompletedProcess[str]) -> bool:
+    return result.returncode == PROCESS_TIMEOUT_EXIT_CODE and (
+        "[controller] command timed out" in (result.stderr or "")
+    )
+
+
+def _run_reserved_codex_attempt(
+    tracker: accounting.AttemptTracker,
+    *,
+    args: argparse.Namespace,
+    repo: RepoInfo,
+    run_ref: Any,
+    state: dict[str, Any],
+    run_dir: Path,
+    phase: str,
+    schema_rel: str,
+    output_name: str,
+    is_delta_review: bool,
+    prompt: str,
+    profile: dict[str, str],
+    command: list[str],
+    codex_env: dict[str, str],
+    output_path: Path,
+    stage_id: str,
+    pre_exec_identity: Any,
+    pre_exec_contract: Any,
+) -> int:
+    """Launch and process one reserved Codex attempt (the post-reservation half of
+    `cmd_codex`). `tracker.stage` names the result reason recorded if an exception
+    escapes at that point."""
     started_at = utc_now()
     started_monotonic = time.monotonic()
     # NOTE: the Codex exec MUST go through `run_process` (not a standalone Popen) so
@@ -6763,9 +6969,21 @@ def cmd_codex(args: argparse.Namespace) -> int:
         result.stderr, _CODEX_OUTPUT_MAX_BYTES
     )
 
+    # Capture execution outcome and usage BEFORE any failure/rejection path below
+    # deletes the staged events, so spend is accounted for every attempt.
+    tracker.record_process(
+        returncode=result.returncode,
+        timed_out=_is_timeout_result(result),
+        duration_seconds=duration_seconds,
+        stdout_text=stdout_text,
+        stdout_truncated=codex_stdout_truncated,
+        observed_model=parse_codex_model(stdout_text),
+    )
+
     events_path = run_dir / f".staging-{stage_id}.events.ndjson"
 
     if result.returncode != 0:
+        tracker.stage = "timeout" if _is_timeout_result(result) else "nonzero_exit"
         # Re-validate identity + exact-active status under the lock before publishing the failure
         # log: a concurrent cancel/block during the long exec must not be resurrected.
         staged_error = run_dir / f".staging-{stage_id}.stderr.log"
@@ -6795,13 +7013,15 @@ def cmd_codex(args: argparse.Namespace) -> int:
             error_path = run_dir / f"{phase}.codex.stderr.log"
             staged_error.replace(error_path)
             err_state.setdefault("notes", []).append(
-                f"Codex {phase} failed; see {make_relative_path(error_path, run_dir)}"
+                f"Codex {phase} failed (attempt {tracker.attempt_id}); see "
+                f"{make_relative_path(error_path, run_dir)}"
             )
             save_run_state(run_dir, err_state)
         raise WorkflowError(codex_failure)
 
     staged_output, staged_events = output_path, events_path
     published = False
+    tracker.stage = "internal_error"
     try:
         # M1: write the BOUNDED NDJSON events so the on-disk artifact is size-capped.
         events_path.write_text(stdout_text, encoding="utf-8")
@@ -6814,35 +7034,42 @@ def cmd_codex(args: argparse.Namespace) -> int:
         # Size-check the --output-last-message file before read+parse: the review schemas set no
         # length bounds, so a pathological response could be materialized twice in memory. Fail
         # closed -- reject an over-size payload, never truncate into invalid JSON.
+        tracker.stage = "missing_output"
         try:
             output_size = output_path.stat().st_size
         except OSError as exc:
             raise WorkflowError(
                 f"Codex did not produce valid JSON at {output_path}: {exc}"
             ) from exc
+        tracker.stage = "oversize_output"
         if output_size > _CODEX_OUTPUT_MAX_BYTES:
             raise WorkflowError(
                 f"Codex {phase} output at {output_path} is {output_size} bytes, "
                 f"which exceeds the {_CODEX_OUTPUT_MAX_BYTES}-byte ceiling; "
                 "refusing to parse it (fail closed)."
             )
+        tracker.stage = "invalid_json"
         try:
             output_text = output_path.read_text(encoding="utf-8")
+            tracker.output_characters = len(output_text)
             parsed = json.loads(output_text)
         except (OSError, json.JSONDecodeError) as exc:
             raise WorkflowError(
                 f"Codex did not produce valid JSON at {output_path}: {exc}"
             ) from exc
+        tracker.stage = "not_object"
         if not isinstance(parsed, dict):
             raise WorkflowError(f"Codex output must be an object: {output_path}")
         # Full schema validation, fail closed: a downgraded Codex CLI could return valid JSON that
         # violates the schema (missing new_findings, out-of-enum severity); reject before the merge.
+        tracker.stage = "schema_invalid"
         try:
             validate_payload(
                 parsed, schema_rel, label=f"Codex {phase} output at {output_path}"
             )
         except SchemaValidationError as exc:
             raise WorkflowError(str(exc)) from exc
+        tracker.stage = "semantic_invalid"
         if phase == "review":
             if is_delta_review:
                 _require_finding_items(
@@ -6885,8 +7112,10 @@ def cmd_codex(args: argparse.Namespace) -> int:
         # Recompute round/index from fresh state inside the lock to close the
         # TOCTOU gap between the pre-Codex snapshot check and the post-Codex write.
         final_path = output_path
+        tracker.stage = "internal_error"
         with RunStateLock(run_dir):
             state = load_run_state(run_dir)
+            tracker.stage = "run_inactive"
             verify_loaded_run_identity(
                 state, run_dir=run_dir, expected_repo_id=repo.id
             )
@@ -6898,6 +7127,7 @@ def cmd_codex(args: argparse.Namespace) -> int:
                 )
             # For imported runs, re-verify target identity AFTER exec before publishing, so a
             # branch/HEAD/worktree change during the Codex run is not recorded as the imported target's verdict.
+            tracker.stage = "target_drift"
             reverify_imported_target_after_exec(
                 state,
                 repo.canonical_root,
@@ -6906,13 +7136,16 @@ def cmd_codex(args: argparse.Namespace) -> int:
             )
             # Also re-check the contract snapshot: a mid-run refresh can change base/metadata/verification
             # without changing HEAD/branch, which the identity re-check would miss.
+            tracker.stage = "contract_drift"
             require_review_contract_unchanged(
                 state, pre_exec_contract, operation=f"codex {phase}"
             )
+            tracker.stage = "internal_error"
             phase_label = phase
             if phase == "review":
                 next_round = int(state.get("review_round", 0)) + 1
                 maximum = int(state.get("max_review_rounds", 3))
+                tracker.stage = "review_budget_exhausted"
                 if next_round > maximum:
                     state["status"] = "blocked"
                     state["phase"] = "review-budget-exhausted"
@@ -6931,6 +7164,7 @@ def cmd_codex(args: argparse.Namespace) -> int:
                     for r in state.get("reviews", [])
                 )
                 expected_delta = next_round >= 2 and has_full_review
+                tracker.stage = "round_mode_mismatch"
                 if expected_delta != is_delta_review:
                     raise WorkflowError(
                         "Review round-mode mismatch (concurrent invocation?): "
@@ -6944,6 +7178,7 @@ def cmd_codex(args: argparse.Namespace) -> int:
                 # canonical publish below, or a rejected payload leaves canonical
                 # artifacts on disk while state stays unchanged (the `finally` only
                 # cleans the staging paths, which the publish already consumed).
+                tracker.stage = "semantic_invalid"
                 _require_unique_acceptance_criteria(
                     parsed.get("acceptance_criteria_assessment")
                     if isinstance(parsed.get("acceptance_criteria_assessment"), list)
@@ -7011,6 +7246,7 @@ def cmd_codex(args: argparse.Namespace) -> int:
                         "contract_snapshot": review_contract_snapshot(state),
                     }
                 )
+                tracker.stage = "semantic_invalid"
                 if is_delta_review:
                     merge_delta_review(
                         state,
@@ -7030,8 +7266,10 @@ def cmd_codex(args: argparse.Namespace) -> int:
                         "verdict": parsed.get("verdict"),
                     }
                 )
+                tracker.stage = "semantic_invalid"
                 merge_adversarial_review(state, parsed, index)
 
+            tracker.stage = "internal_error"
             usage_record: dict[str, Any] = {
                 "phase": phase_label,
                 "prompt_characters": len(prompt),
@@ -7043,6 +7281,7 @@ def cmd_codex(args: argparse.Namespace) -> int:
                 "started_at": started_at,
                 "events_artifact": make_relative_path(events_path, run_dir),
                 "output_artifact": make_relative_path(final_path, run_dir),
+                "attempt_id": tracker.attempt_id,
             }
             if token_usage:
                 usage_record["tokens"] = token_usage
@@ -7050,6 +7289,7 @@ def cmd_codex(args: argparse.Namespace) -> int:
 
             state["stop_gate_blocks"] = 0
             save_run_state(run_dir, state)
+            tracker.published = True
         published = True
     finally:
         # On any failure before the locked publish completes, remove the
@@ -8350,6 +8590,78 @@ def cmd_usage_report(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
+# cmd_accounting
+# ---------------------------------------------------------------------------
+
+
+def _parse_since(value: str) -> dt.datetime:
+    try:
+        moment = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"not an ISO-8601 time: {value!r}") from exc
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=dt.timezone.utc)
+    return moment
+
+
+def _positive_int(value: str) -> int:
+    try:
+        number = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"not an integer: {value!r}") from exc
+    if number < 1:
+        raise argparse.ArgumentTypeError("must be >= 1")
+    return number
+
+
+def cmd_accounting(args: argparse.Namespace) -> int:
+    """Codex attempt accounting. Queries are read-only: no repository or run
+    context, no lock, and nothing is created when the ledger does not exist."""
+    now = accounting.utc_now()
+    boot_id = accounting.current_boot_id()
+    action = args.accounting_action
+    if action == "reconcile":
+        home = accounting.resolve_accounting_home()
+        outcome = accounting.Ledger(home).reconcile_abandoned(
+            args.attempt_id, now=now, boot_id=boot_id
+        )
+        payload: dict[str, Any] | None = {
+            "format": accounting.RECONCILE_FORMAT,
+            "attempt_id": args.attempt_id,
+            "settled_as": args.reconcile_as,
+            "outcome": outcome,
+        }
+    else:
+        home = (
+            Path(args.ledger_dir).expanduser().resolve()
+            if args.ledger_dir
+            else accounting.resolve_accounting_home()
+        )
+        view = accounting.read_ledger(home)
+        if action == "show":
+            payload = accounting.attempt_query(view, args.attempt_id, now=now, boot_id=boot_id)
+            if payload is None:
+                raise WorkflowError(f"Unknown attempt {args.attempt_id!r} in {home}")
+        else:
+            query = accounting.QueryFilter(
+                repo_id=args.filter_repo_id, run_id=args.filter_run_id, since=args.since
+            )
+            if action == "summary":
+                payload = accounting.summary_query(view, query, now=now, boot_id=boot_id)
+            else:
+                payload = accounting.attempts_query(
+                    view,
+                    query,
+                    now=now,
+                    boot_id=boot_id,
+                    unsettled_only=args.unsettled,
+                    limit=args.limit,
+                )
+    print(json.dumps(payload, sort_keys=True, separators=(",", ":")))
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # cmd_triage
 # ---------------------------------------------------------------------------
 
@@ -8852,6 +9164,46 @@ def build_parser() -> argparse.ArgumentParser:
     )
     usage_report.add_argument("--json", action="store_true", help="Output JSON")
     usage_report.set_defaults(func=cmd_usage_report)
+
+    accounting_cmd = sub.add_parser(
+        "accounting",
+        help="Codex attempt accounting ledger: read-only JSON queries and explicit reconcile",
+    )
+    accounting_sub = accounting_cmd.add_subparsers(dest="accounting_action", required=True)
+    accounting_summary = accounting_sub.add_parser(
+        "summary", help="Attempt, outcome, usage and completeness totals"
+    )
+    accounting_attempts = accounting_sub.add_parser(
+        "attempts", help="Compact attempt records, newest first"
+    )
+    accounting_show = accounting_sub.add_parser("show", help="One attempt with its raw events")
+    accounting_show.add_argument("attempt_id")
+    for query_parser in (accounting_summary, accounting_attempts, accounting_show):
+        query_parser.add_argument(
+            "--ledger-dir",
+            help="Read this accounting home instead of the resolved one (read-only)",
+        )
+    for filtered_parser in (accounting_summary, accounting_attempts):
+        filtered_parser.add_argument("--filter-repo-id", help="Only attempts for this repository id")
+        filtered_parser.add_argument("--filter-run-id", help="Only attempts for this run id")
+        filtered_parser.add_argument(
+            "--since", type=_parse_since, help="Only attempts reserved at/after this ISO time"
+        )
+    accounting_attempts.add_argument(
+        "--unsettled", action="store_true", help="Only attempts without a settlement"
+    )
+    accounting_attempts.add_argument(
+        "--limit", type=_positive_int, help="Return at most this many attempts"
+    )
+    accounting_reconcile = accounting_sub.add_parser(
+        "reconcile",
+        help="Operator-confirmed settlement of an unsettled attempt (never relaunches Codex)",
+    )
+    accounting_reconcile.add_argument("attempt_id")
+    accounting_reconcile.add_argument(
+        "--as", dest="reconcile_as", choices=("abandoned",), required=True
+    )
+    accounting_cmd.set_defaults(func=cmd_accounting)
 
     next_action = sub.add_parser(
         "next-action", help="Machine-readable next-phase guidance"

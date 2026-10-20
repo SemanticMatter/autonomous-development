@@ -7,6 +7,12 @@ dependencies = [
     "jsonschema>=4.18",
 ]
 
+[project.optional-dependencies]
+# Development checks run through pre-commit (see .pre-commit-config.yaml).
+dev = [
+    "pre-commit~=4.6",
+]
+
 [tool.ruff]
 line-length = 100
 

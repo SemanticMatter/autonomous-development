@@ -159,6 +159,21 @@ make check
 claude plugin validate . --strict
 ```
 
+`make check` runs the offline test suite through `tests/run_isolated.py`. Use it rather than a
+plain `python -m unittest`: some tests start `controller.py` as a subprocess that looks `codex` up
+on `PATH`. The runner puts a stub `codex` first on `PATH` (dropping directories that hold another
+`codex`), passes an allowlisted environment without provider credentials, and points `HOME`, the
+XDG directories and `CODEX_HOME` at a temporary directory. It is not a sandbox: the tests keep
+normal file-system and network access, and the isolation holds only for code that finds Codex
+and its configuration through `PATH` and those variables. Use an interpreter with
+`requirements.txt` installed. The same checks run
+through [pre-commit](https://pre-commit.com/) (`pip install -r requirements.txt 'pre-commit~=4.6'`):
+
+```bash
+pre-commit run --all-files                      # JSON/TOML/YAML, debug statements, layout
+pre-commit run --all-files --hook-stage manual  # also the isolated offline test suite
+```
+
 ## Adaptive workflow modes
 
 `init` accepts `--mode` to scale workflow depth to the change:
@@ -423,7 +438,9 @@ controller.py run-check --name unit-tests --failure-tail-lines 80 -- pytest -q
 ```
 
 Codex phases run with `codex exec --json`, retain the NDJSON event stream, and record per-phase
-usage. Inspect it with:
+usage for published results in the run state. Every attempt, including failed and rejected ones,
+is also recorded durably outside run state; see [Codex attempt accounting](#codex-attempt-accounting).
+Inspect the per-run view with:
 
 ```bash
 controller.py usage-report
@@ -469,6 +486,128 @@ controller.py init --feature "..."
 
 On macOS the default is `~/Library/Application Support/claude-autonomous/`.
 On Windows the default is `%LOCALAPPDATA%\claude-autonomous\`.
+
+## Codex attempt accounting
+
+Every `controller.py codex` invocation is recorded in a per-host, append-only ledger that lives
+outside run state, so deleting a run directory or a temporary `--state-dir` never deletes it.
+The attempt is reserved **before** `codex exec` starts and settled once afterwards. The settlement
+has three independent outcomes:
+
+- `execution`: `exited`, `timed_out`, `interrupted`, `launch_failed` or `unknown`.
+- `result`: whether the engine `published` the Codex result, or `rejected` it and why (for example
+  `nonzero_exit`, `schema_invalid`, `run_inactive` or `contract_drift`).
+- `usage`: `complete`, `partial`, `unavailable`, `invalid` or `not_applicable`. Counters are
+  `input_tokens`, `cached_input_tokens` (a subset of input), `output_tokens` and
+  `reasoning_output_tokens` (a subset of output). Usage is kept for failed and rejected attempts.
+
+The ledger location does **not** follow `--state-dir` or `CLAUDE_AUTONOMOUS_STATE_HOME`, and it
+must not lie inside the effective run-state home. That also excludes a state home set to a broad
+parent of the accounting home, such as `$XDG_STATE_HOME` itself. Such a launch is refused, and
+there is no bypass. Only this direction is checked: a run-state home inside the accounting home
+is not refused, although it is not recommended. To fix a refusal, point `--state-dir` or
+`CLAUDE_AUTONOMOUS_STATE_HOME` at its own directory, or set `CLAUDE_AUTONOMOUS_ACCOUNTING_HOME`
+outside the state home.
+
+```bash
+# 1. Explicit accounting home (must be an absolute path outside the reviewed repository)
+export CLAUDE_AUTONOMOUS_ACCOUNTING_HOME=/path/to/accounting
+# 2. $XDG_STATE_HOME/claude-autonomous-accounting/ (absolute XDG values only)
+# 3. Default: ~/.local/state/claude-autonomous-accounting/
+#    (macOS: ~/Library/Application Support/claude-autonomous-accounting/,
+#     Windows: %LOCALAPPDATA%\claude-autonomous-accounting\)
+```
+
+If the attempt cannot be recorded, **Codex is not launched**. That happens when the location is
+unwritable, relative, inside the repository or inside the run-state home (where deleting run state
+would delete it), the lock times out, a file or directory cannot be synced, the ledger metadata
+(`ledger.json`) is corrupt, or the metadata is missing while events already exist. If the
+reservation line was written but could not be synced, it can remain as an unsettled attempt that
+never launched; the error names it so it can be reconciled. The engine never repairs, replaces or deletes ledger files; the error says how to
+inspect them. Damage to individual event lines is tolerated: malformed or torn lines, invalid
+events, orphan or conflicting settlements, and duplicate or conflicting event ids are skipped or
+resolved first-wins, new events are appended after them, and queries report them as diagnostics.
+Writers validate the history of the attempts they act on exactly as queries do, so an invalid
+line never blocks a later valid settlement. Timestamps must have the form the engine writes,
+`YYYY-MM-DDTHH:MM:SS+00:00` (or `Z`), with a real date and hours `00`–`23`. Any other value,
+including hour `24`, is invalid on every supported Python version. This applies to stored ledger
+events only, not to the `--since` query argument (see below).
+Damage to the metadata is not tolerated: it refuses every write until an operator restores it.
+If recording the outcome fails after Codex ran, the engine result is kept and a
+`[accounting]` warning is printed. The attempt then normally stays visibly unsettled; if only the
+final sync failed, it may show as settled without a durability guarantee. An exception after the
+result was published (for example a broken output pipe) still records the attempt as `published`.
+
+A new invocation gets a new attempt id. When the previous attempt for the same run, review slot
+(for example `review-01`) and review-contract generation was not published, `retry_of` links to
+it. This is bookkeeping only: it does not prove that both attempts saw identical inputs, and it
+authorizes nothing. `import-pr --refresh` that supersedes the reviews starts a new generation, so
+a reused slot name is not linked across it. Nothing is ever relaunched automatically. Optionally
+set `CLAUDE_AUTONOMOUS_HOST_LABEL` (for example `work`) to label attempts; host names are never
+recorded.
+
+Queries print compact, versioned JSON with completeness indicators and diagnostics.
+`completeness.tokens_complete` is true only when the ledger exists, every matching attempt is
+settled with `complete` (or `not_applicable`) usage, and no integrity diagnostic is set; events
+recorded under another `ledger_id` count as an integrity problem. Replacement `ledger.json`
+metadata that is itself valid does not stop writers: they keep appending under the new id, the
+earlier events stay in place, and `tokens_complete` stays false until an operator resolves the
+mismatch. Queries are read-only: they take no lock, create nothing, and accept `--ledger-dir DIR`
+to read another accounting home:
+
+```bash
+controller.py accounting summary  [--filter-repo-id ID] [--filter-run-id ID] [--since ISO]
+controller.py accounting attempts [--filter-repo-id ID] [--filter-run-id ID] [--since ISO] \
+                                  [--unsettled] [--limit N]
+controller.py accounting show <attempt-id>
+```
+
+`--since` is parsed by the interpreter's `datetime.fromisoformat`, so a few spellings depend on the
+Python version. Notably, hour `24` is read as the next midnight on Python 3.14 and rejected on
+3.11 and 3.12. Use hours `00`–`23` for portable queries. This affects only which attempts a query
+selects (the value is echoed in `filters.since`), not whether a stored ledger event is valid.
+
+`reconcile` is the only mutating accounting command. It takes the ledger lock and appends one
+operator settlement (`unknown` execution and result, `unavailable` usage) to the resolved
+accounting home. It is refused while the launching controller may still be alive: it needs
+`owner_process` `gone`, or `unknown` together with `stale`. There is no override. This trades
+waiting for safety: a controller that is still running would otherwise have its own settlement
+refused. On hosts without a boot id, such as macOS and Windows, the owner is always `unknown`, so
+an operator waits until the attempt is stale: its timeout plus five minutes, which is 65 minutes
+by default and 24 hours when the timeout is disabled. While a process with the recorded PID is
+running on the same boot, the owner is `alive` and reconcile is refused, even if that process is
+an unrelated one that reused the PID. Reconcile becomes possible once that process exits or the
+host reboots. An unknown attempt id is refused without creating anything. It never relaunches
+Codex:
+
+```bash
+controller.py accounting reconcile <attempt-id> --as abandoned
+```
+
+Guarantees and limits:
+
+- Each event is one line written with a single append and `fsync`ed before the call returns.
+  New files and directories are also synced into their parent directory, and every write
+  re-syncs the ledger's own directory entries itself rather than trusting another writer's
+  initialization; a sync error refuses the write. Directory sync is skipped only where it is unsupported (Windows, or file systems that
+  reject it with `EINVAL`/`ENOTSUP`). This survives a crash of the controller. It survives OS crash
+  or power loss only as far as the storage stack honors `fsync`; that has not been verified for
+  WSL2's virtual disk, and the offline tests only inject faults into these calls.
+- A crash mid-append damages at most the last line. Readers report it (`incomplete_tail`,
+  `malformed_lines`) and the next append starts on a fresh line. Settled lines are never rewritten.
+- Replayed or duplicated lines are reported as diagnostics and are never counted twice.
+- An attempt whose controller was killed (for example by SIGTERM or SIGKILL) stays unsettled,
+  with `owner_process` reported as `alive`, `gone` or `unknown` (PID reuse makes `alive`
+  advisory). It is reported as `stale` once it is older than its timeout plus five minutes. Its
+  usage stays unknown, and the engine does not stop a Codex child that outlives the controller.
+- `partial`, `unavailable` and `invalid` usage are counted separately and never treated as
+  complete; `tokens.complete_only` and `tokens.including_partial` are reported side by side.
+- The ledger is not protected against other processes running as the same user. Locking is not
+  supported on network or `drvfs` (`/mnt/c`) file systems.
+- No prompt, output or stderr text, environment, absolute path, host name or credential is
+  recorded; the event schema (`schemas/codex-attempt-event.schema.json`) rejects unlisted fields.
+- Token counts are not currency costs. Historical runs are not imported; `usage-report` remains
+  the per-run view of published phases.
 
 ## State and generated artifacts
 

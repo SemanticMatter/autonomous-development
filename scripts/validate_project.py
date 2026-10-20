@@ -112,6 +112,8 @@ def main() -> int:
     required = [
         ROOT / "scripts/controller.py",
         ROOT / "scripts/stop_gate.py",
+        ROOT / "scripts/accounting.py",
+        ROOT / "schemas/codex-attempt-event.schema.json",
         ROOT / "prompts/enhance-idea.md",
         ROOT / "prompts/implementation-plan.md",
         ROOT / "prompts/code-review.md",
